@@ -1,0 +1,41 @@
+# Окружение и секреты
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# Личные настройки Claude Code (общие .claude/settings.json коммитим)
+.claude/settings.json
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+.mypy_cache/
+.ruff_cache/
+
+# Данные и результаты запусков
+data/
+Регрессия/
+Многоклассовая классификация/
+outputs/
+workdir/
+catboost_info/
+AutogluonModels/
+lightning_logs/
+*.csv
+*.parquet
+*.pkl
+*.joblib
+
+# Сборки
+*.zip
+dist/
+build/
+
+# ОС и IDE
+.DS_Store
+.idea/
+.vscode/
