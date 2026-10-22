@@ -121,3 +121,48 @@ def test_clip_and_estimate():
     assert P.clip("x" * 100, 30).endswith("...[truncated]...") and len(P.clip("x" * 100, 30)) <= 30
     assert P.clip("a" * 50 + "END", 30, tail=True).endswith("END")
     assert P.estimate_tokens("abcd" * 10) == 10 and P.estimate_tokens("абвг") == 2
+
+
+def history(columns: list[str], n: int):
+    """n экспериментов с реалистичными названиями, диффами и ошибками на колонках задачи."""
+    from memory import Experiment, ExperimentMemory
+    memory = ExperimentMemory(columns=columns)
+    kinds = ["features", "encoding", "params", "missing", "feature_selection", "outliers"]
+    for i in range(1, n + 1):
+        a, b = columns[i % len(columns)], columns[(3 * i) % len(columns)]
+        status = "accepted" if i % 5 == 0 else "failed" if i % 7 == 0 else "rejected"
+        diff = "\n".join(f'+        df["{a}_x_{b}_{j}"] = df["{a}"] * df["{b}"] / (df["{b}"].abs() + {j})'
+                         for j in range(8))
+        memory.add(Experiment(
+            id=i, hypothesis=f"Ratio of {a} to {b} with a smoothing term, variant {i}", kind=kinds[i % 6],
+            status=status, cv_score=41.0 - i / 100, gain=0.05 if status == "accepted" else -0.01,
+            error=("Traceback ... KeyError: 'no_such_col'" if status == "failed"
+                   else "harness: PARAMS['is_unbalance'] is not allowed for lightgbm, ignored | gain -0.01 <= 0.05"),
+            columns=[a, b], diff=diff))
+    memory.add_note("Ratios of area to weather help a bit; encodings of facility_type do not. Try group stats. " * 3)
+    return memory
+
+
+@pytest.mark.parametrize("n", [12, 30])
+def test_prompts_with_long_memory_fit_budget(regression_like, n):
+    profile, notes, task_text, base_code = regression_like
+    columns = [c["name"] for c in profile["columns"]]
+    memory = history(columns, n)
+    cfg = agent.AgentConfig()
+    brief = memory.planner_brief(cfg.memory_chars, kinds=P.KINDS, task_type="regression")
+    plan = P.build_plan_messages(
+        task_line="type: regression | metric: rmse (lower is better) | target: site_eui", task_text=task_text,
+        profile=P.render_profile(profile, notes, max_chars=cfg.profile_chars), base_code=base_code,
+        cv_text="CV rmse = 41.23", memory=brief, n=6, memory_chars=cfg.memory_chars)
+    code = P.build_code_messages(
+        task_line="type: regression | metric: rmse", columns=P.render_columns_brief(profile), insights="x" * 500,
+        base_code=base_code, cv_text="CV rmse = 41.2", hypothesis={"title": "Log of floor_area", "kind": "features"},
+        memory=memory.summary(cfg.coder_memory_chars, recent=4), memory_chars=cfg.coder_memory_chars,
+        model_params=agent.MODEL_PARAMS, timeout=300)
+    assert P.messages_tokens(plan) <= BUDGET_TOKENS, P.messages_tokens(plan)
+    assert P.messages_tokens(code) <= BUDGET_TOKENS, P.messages_tokens(code)
+    assert brief in plan[1]["content"]  # сводка не обрезана сборщиком промпта
+    assert "Accepted steps" in brief and "Kinds not tried yet: target_transform, model" in brief
+    assert "Accepted steps" in code[1]["content"]
+    print(f"\nn={n}: planner {P.messages_tokens(plan)} tok (memory {len(brief)} chars), "
+          f"coder {P.messages_tokens(code)} tok")
