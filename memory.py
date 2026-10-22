@@ -183,6 +183,23 @@ def _one_line(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
+_FAILURE_CAUSES = re.compile(r"timeout|static check|NaN avalanche|inf values|row count|columns differ|"
+                             r"look like a row index|evaluation failed|no time left|no \S+ code block|"
+                             r"same code|[A-Z]\w*(?:Error|Exception)")
+
+
+def _failure_cause(error: str) -> str:
+    """Короткая причина падения для итога по видам: тип ошибки или вид проверки харнесса."""
+    found = _FAILURE_CAUSES.search(error or "")
+    return found.group(0) if found else _one_line(error or "unknown", 30)
+
+
+def _diff_preview(diff: str, max_lines: int = 3) -> list[str]:
+    lines = [line for line in (diff or "").splitlines() if line.strip()]
+    preview = [_one_line(line, 100) for line in lines[:max_lines]]
+    return preview + ([f"... (+{len(lines) - max_lines} lines)"] if len(lines) > max_lines else [])
+
+
 def _format(exp: Experiment) -> str:
     head = f"#{exp.id} [{exp.status}] {exp.kind} | {_one_line(exp.hypothesis, 80)}"
     if exp.status == "failed":
@@ -239,28 +256,73 @@ class ExperimentMemory:
         failed = [e for e in matches if e.status == "failed"]
         return failed[-1] if len(failed) >= 2 else None
 
+    def kind_stats(self) -> list[str]:
+        """Итог по видам гипотез: сколько пробовали, принято (лучший выигрыш), отклонено, упало (почему)."""
+        groups: dict[str, list[Experiment]] = {}
+        for exp in self.experiments:
+            groups.setdefault(exp.kind, []).append(exp)
+        lines = []
+        for kind, exps in groups.items():
+            accepted = [e for e in exps if e.status == "accepted"]
+            gains = [e.gain for e in accepted if e.gain is not None and math.isfinite(e.gain)]
+            parts = [f"{len(exps)} tried", f"{len(accepted)} accepted"
+                     + (f" (best gain {max(gains):+.4g})" if gains else "")]
+            rejected = sum(e.status == "rejected" for e in exps)
+            if rejected:
+                parts.append(f"{rejected} rejected")
+            failed = [e for e in exps if e.status == "failed"]
+            if failed:
+                causes = list(dict.fromkeys(_failure_cause(e.error) for e in failed))
+                parts.append(f"{len(failed)} failed ({', '.join(causes[:2])})")
+            lines.append(f"{kind}: {', '.join(parts)}")
+        return lines
+
     def summary(self, max_chars: int = 1500, recent: int = 8) -> str:
-        """Сводка для промпта: последние эксперименты подробно, старые — одной строкой, заметки критика."""
+        """Сводка для промпта. Секции по приоритету, при нехватке места режется низший:
+        принятые шаги (с диффом) > итог по видам > последние эксперименты > «уже пробовали» > заметки критика.
+        Принятые шаги и самый свежий эксперимент не выкидываются; длина не больше max_chars."""
         if not self.experiments and not self.notes:
             return "No experiments yet."
-        recent_lines = [_format(exp) for exp in self.experiments[-recent:]]
-        older = self.experiments[:-recent] if len(self.experiments) > recent else []
-        earlier = ("Earlier: " + "; ".join(f"#{e.id} {e.status} {_one_line(e.hypothesis, 40)}" for e in older)
-                   if older else "")
-        notes = ["Critic notes:"] + [f"- {note}" for note in self.notes] if self.notes else []
+        accepted = [e for e in self.experiments if e.status == "accepted"]
+        others = [e for e in self.experiments if e.status != "accepted"]
+        latest = others[-recent:] if recent > 0 else []
+        older = others[: len(others) - len(latest)]
+        diffs = {e.id: _diff_preview(e.diff) for e in accepted}
+        by_kind = self.kind_stats() if len(self.experiments) > recent else []
+        tried = [f"{_one_line(e.hypothesis, 50)} ({e.status})" for e in older]
+        notes = list(self.notes)
 
         def render() -> str:
-            lines = [earlier] if earlier else []
-            if recent_lines:
-                lines += ["Experiments (oldest first):", *recent_lines]
-            return "\n".join(lines + notes)
+            blocks = []
+            if accepted:
+                lines = ["Accepted steps (already in the current best):"]
+                for exp in accepted:
+                    lines += [_format(exp), *("    " + line for line in diffs[exp.id])]
+                blocks.append("\n".join(lines))
+            if by_kind:
+                blocks.append("By kind: " + "; ".join(by_kind))
+            if latest:
+                blocks.append("\n".join(["Recent experiments (oldest first):", *map(_format, latest)]))
+            if tried:
+                blocks.append("Already tried, do not repeat: " + "; ".join(tried))
+            if notes:
+                blocks.append("\n".join(["Critic notes:", *(f"- {note}" for note in notes)]))
+            return "\n".join(blocks)
 
         text = render()
-        while len(text) > max_chars and (earlier or len(recent_lines) > 1):
-            if earlier:
-                earlier = ""
+        while len(text) > max_chars:
+            if notes:
+                notes.pop(0)
+            elif tried:
+                tried.pop(0)
+            elif len(latest) > 1:
+                latest.pop(0)
+            elif any(diffs.values()):
+                diffs[next(i for i, lines in diffs.items() if lines)] = []
+            elif by_kind:
+                by_kind.clear()
             else:
-                recent_lines.pop(0)
+                break
             text = render()
         return text if len(text) <= max_chars else text[: max_chars - 3] + "..."
 

@@ -170,3 +170,63 @@ def test_find_similar_rejected_blocks_failed_allows_one_retry():
     assert memory.find_similar("sbytes divided by dbytes", "features") is None  # одно падение — можно повторить
     exp(memory, "sbytes / dbytes ratio", "failed", error="KeyError")
     assert memory.find_similar("sbytes divided by dbytes", "features").id == 3
+
+
+def long_history(n=30):
+    """n экспериментов разных видов: 3 принятых с диффами, падения с разными причинами, заметки критика."""
+    memory = ExperimentMemory(columns=COLUMNS)
+    kinds = ["features", "encoding", "params", "missing", "model", "feature_selection"]
+    for i in range(1, n + 1):
+        kind = kinds[i % len(kinds)]
+        if i in (3, 11, 20):
+            exp(memory, f"accepted idea {i} on floor_area", "accepted", kind=kind, cv_score=40 - i / 10, gain=0.1 * i,
+                diff="\n".join(f'+        df["f{i}_{j}"] = df["floor_area"] * {j}' for j in range(6)))
+        elif i % 7 == 0:
+            exp(memory, f"crashing idea {i}", "failed", kind=kind,
+                error="timeout: building features took longer than 300 s" if i % 2 else "KeyError: 'zzz'")
+        else:
+            exp(memory, f"rejected idea number {i} with a long descriptive title", kind=kind, cv_score=41.0,
+                gain=-0.01, error="gain -0.01 <= threshold 0.05")
+    for k in range(3):
+        memory.add_note(f"critic note {k}: interactions of area help, encodings do not " * 3)
+    return memory
+
+
+@pytest.mark.parametrize("max_chars", [400, 800, 1500, 3000])
+def test_summary_keeps_accepted_and_fits(max_chars):
+    text = long_history().summary(max_chars=max_chars)
+    assert len(text) <= max_chars
+    assert "#30 " in text  # самый свежий не выкидывается
+    if max_chars >= 800:
+        assert all(f"#{i} [accepted]" in text for i in (3, 11, 20))
+
+
+def test_summary_sections_on_long_history():
+    text = long_history().summary(max_chars=1500)
+    assert text.startswith("Accepted steps (already in the current best):")
+    assert "By kind: " in text
+    for kind in ["features", "encoding", "params", "missing", "model", "feature_selection"]:
+        assert f"{kind}: " in text, kind
+    assert "1 accepted (best gain +2)" in text  # #20 — model
+    assert "failed (timeout)" in text or "failed (KeyError)" in text
+    assert "Recent experiments (oldest first):" in text
+
+
+def test_summary_with_room_shows_diffs_tried_and_notes():
+    text = long_history().summary(max_chars=6000)
+    assert '    + df["f3_0"] = df["floor_area"] * 0' in text and "... (+3 lines)" in text  # отступы схлопнуты
+    assert "Already tried, do not repeat: rejected idea number 1 with" in text
+    assert "Critic notes:" in text
+
+
+def test_summary_drops_low_priority_first():
+    memory = long_history()
+    full, mid = memory.summary(max_chars=6000), memory.summary(max_chars=1500)
+    assert "Critic notes:" in full and "Critic notes:" not in mid  # заметки режутся первыми
+    assert "By kind: " in mid  # итог по видам — дольше всех после принятых
+
+
+def test_summary_short_history_has_no_kind_totals():
+    memory = ExperimentMemory()
+    exp(memory, "a", "rejected", cv_score=1.0, gain=-0.1)
+    assert "By kind" not in memory.summary() and "Recent experiments" in memory.summary()
