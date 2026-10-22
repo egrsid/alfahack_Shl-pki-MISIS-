@@ -102,32 +102,40 @@ class Experiment:            # + поля со значениями по умо�
     diff: str = ""            # сжатый дифф кода относительно базы (только +/- строки, ≤ ~15 строк)
     base_hash: str = ""       # code_hash базы, от которой сделан эксперимент
 
-code_diff(old: str, new: str, max_lines: int = 15) -> str
+code_diff(old: str, new: str, max_lines: int = 15) -> str      # 0 — без обрезки; при обрезке важнее «+»
 columns_in(code: str, known: Iterable[str]) -> list[str]      # строковые литералы, совпадающие с колонками
-similar_titles(a: str, b: str) -> float                        # 0..1, токены без стоп-слов + синонимы
+title_tokens(title) -> set[str]                                # смысловые слова: без стоп-слов, синонимы
+mentioned_columns(text, known) -> set[str]                     # колонки, названные в тексте целым словом
+similar_titles(a: str, b: str) -> float                        # 0..1, среднее Жаккара и перекрытия
+same_idea(title_a, kind_a, title_b, kind_b, columns=(), threshold=0.6) -> bool   # правило раздела 6
 
-ExperimentMemory:
-    find_similar(title, kind, columns=None, threshold=0.6) -> Experiment | None
-    coverage(all_columns, kinds) -> dict      # untried_kinds, exhausted_kinds, untouched_columns
-    planner_brief(max_chars, all_columns, kinds) -> str   # summary + покрытие, для планировщика
+ExperimentMemory(columns=())                  # колонки задачи (агент заполняет в _prepare)
+    same_idea(...), find_similar(title, kind, threshold=0.6) -> Experiment | None
+    kind_stats() -> list[str]                 # итог по видам
+    coverage(all_columns=None, kinds=(), task_type="") -> dict   # untried_kinds, exhausted_kinds,
+                                              #   untouched_columns, n_untouched_columns
+    planner_brief(max_chars, all_columns=None, kinds=(), task_type="") -> str   # summary + покрытие
     summary(max_chars, recent=8) -> str       # та же сигнатура, новое сжатие (раздел 5)
-    load_jsonl(path) -> ExperimentMemory      # classmethod, обратный dump_jsonl
+    load_jsonl(path, columns=()) -> ExperimentMemory   # classmethod, обратный dump_jsonl
 ```
 
 ## 4. Проводка в `agent.py` (минимальные точки)
 
 1. `_iterate` → при записи `Experiment` заполнять `columns`, `diff`, `base_hash` (код базы и колонки уже есть в цикле).
+   Колонки — литералы в диффе плюс целые группы `spec`, если дифф обращается к `"cat_cols"`/`"date_cols"`/`"text_cols"`.
 2. `normalize_hypotheses` → дубли по `memory.find_similar`, а не только по точному названию (через параметр, по умолчанию — старое поведение).
 3. `_plan` → `memory.planner_brief(...)` вместо `memory.summary(...)`, если метод есть.
-4. `_write_code` → в сводку для кодера — диффы принятых шагов («что уже дало выигрыш»).
+4. `_write_code` → в сводку для кодера — диффы принятых шагов («что уже дало выигрыш»): `summary(coder_memory_chars, recent=4)`.
 
 Каждая точка — отдельный маленький коммит; тесты цикла (`tests/test_agent_loop.py`) обязаны оставаться зелёными.
 
 ## 5. Сжатие сводки (`summary`)
 
-Секции по приоритету; при нехватке места режется низший приоритет, высший не режется никогда:
+Секции по приоритету; при нехватке места режется низший приоритет (порядок резки: заметки → «не повторять» →
+последние, кроме самого свежего → диффы принятых → итог по видам), принятые шаги и самый свежий эксперимент не режутся:
 1. **Принятые шаги** — всегда целиком: `#id kind | title | gain | дифф (≤ 3 строки)`.
-2. **Итог по kind** — одна строка на вид: `features: 6 tried, 1 accepted (best +0.024), 3 rejected ≈0, 2 failed (timeout)`.
+2. **Итог по kind** — одна строка на вид: `features: 6 tried, 1 accepted (best gain +0.024), 3 rejected, 2 failed (timeout)`;
+   только когда экспериментов больше, чем `recent`.
 3. **Последние N** экспериментов подробно (как сейчас).
 4. **Не повторять** — короткие названия отклонённых/упавших одной строкой.
 5. **Заметки критика.**
@@ -140,7 +148,11 @@ ExperimentMemory:
 - Токены названия: нижний регистр, без пунктуации и стоп-слов (`of, the, for, add, create, feature(s), column(s)…`),
   простая нормализация форм (`encoding/encode/encoded`), словарь синонимов (`frequency≈count`, `ratio≈divide`,
   `interaction≈product`, `log≈log1p`, `nan≈missing`).
-- Дубль, если `similar_titles ≥ threshold` **и** совпадает `kind`, либо совпадают `kind` и непустой набор `columns`.
+- Дубль только при совпадающем `kind`. Если в обоих названиях есть колонки задачи: разные наборы → не дубль;
+  одинаковые → сравниваются «действия» (слова без имён колонок). Без колонок — сходство всего названия ≥ `threshold`.
+  Противоположные действия (`increase`/`decrease`) — никогда не дубль.
+  (Исходное правило «совпали `kind` и колонки → дубль» отброшено: `sbytes/dbytes` и `sbytes − dbytes` — разные идеи.)
+- Проверка идёт против памяти, очереди и гипотез выше в том же плане.
 - Повтор *отклонённой* гипотезы — отсекается; повтор *упавшей* — разрешён один раз (могла упасть из-за кода, а не идеи).
 - Порог калибруется табличным тестом на парах «дубль / не дубль» (≥ 20 пар, включая реальные названия из живых прогонов).
 
@@ -214,4 +226,6 @@ LLM_DISABLED=1 .venv/bin/python -m pytest tests/ -q                     # все
 ## Статус
 - Ветка создана от `feature/agent-loop` (`3ee8acb`), запушена в `origin/feature/experiment-memory`.
 - `agent-loop` ещё не смержен в `main`; в `main` пока нет модулей соседей (`schemas`, `evaluator`, `llm_client`, `sandbox`).
-- Следующий шаг: пункт 0 плана (план-файл в `docs/plans/`), затем шаг 1.
+- Шаги 0–7 плана выполнены (подробности, замеры и ограничения — `docs/plans/feature-experiment-memory.md`, «Статус выполнения»).
+- Следующий шаг: после мержа `agent-loop` — rebase на `main` и PR (раздел 10); на ближайшем живом прогоне Qwen
+  (`--iters 6`) проверить, что re-plan не повторяет перефразированные гипотезы.
