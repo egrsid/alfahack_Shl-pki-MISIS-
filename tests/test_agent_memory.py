@@ -64,3 +64,21 @@ def test_code_hash_ignores_blank_lines_and_trailing_spaces():
 
 def test_normalize_title():
     assert normalize_title("  Log-transform of Floor_Area!! ") == "log transform of floor area"
+
+
+def test_load_jsonl_roundtrip_new_and_old_format(tmp_path):
+    memory = ExperimentMemory(columns=["a", "b"])
+    exp(memory, "ratio a/b", "accepted", cv_score=1.0, gain=0.1, columns=["a", "b"], diff="+ df['r'] = df['a']",
+        base_hash="abc")
+    exp(memory, "boom", "failed", error="KeyError")
+    path = memory.dump_jsonl(tmp_path / "experiments.jsonl")
+    with path.open("a", encoding="utf-8") as fh:  # старый формат, лишний ключ и мусор
+        fh.write('{"id": 3, "hypothesis": "old", "kind": "params", "status": "rejected", "extra": 1}\n')
+        fh.write("not json\n")
+        fh.write('{"id": 4, "hypothesis": "bad", "kind": "x", "status": "maybe"}\n')
+    loaded = ExperimentMemory.load_jsonl(path, columns=["a", "b"])
+    assert [e.hypothesis for e in loaded.experiments] == ["ratio a/b", "boom", "old"]
+    assert loaded.experiments[0].columns == ["a", "b"] and loaded.experiments[0].base_hash == "abc"
+    assert loaded.experiments[2].columns == [] and loaded.experiments[2].diff == ""
+    assert loaded.columns == ["a", "b"] and loaded.next_id() == 4
+    assert ExperimentMemory.load_jsonl(tmp_path / "missing.jsonl").experiments == []

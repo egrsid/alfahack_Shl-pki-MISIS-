@@ -1,8 +1,8 @@
-"""Память экспериментов агента (минимальная версия).
+"""Память экспериментов агента.
 
-Журнал: что пробовали, что приняли/отклонили и почему, что падало. Отдаёт короткую сводку
-для промпта и пишет JSONL для отладки. Сжатие и ранжирование «что ещё не пробовали» —
-ветка feature/experiment-memory.
+Журнал: что пробовали, что приняли/отклонили и почему, что падало, что изменилось в коде.
+Отдаёт сжатую сводку для промпта (принятые шаги не выкидываются никогда), ловит перефразированные
+дубли гипотез, показывает «что ещё не пробовали», пишет и читает JSONL.
 """
 
 from __future__ import annotations
@@ -12,8 +12,9 @@ import json
 import math
 import re
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
+from typing import Iterable
 
 STATUSES = ("accepted", "rejected", "failed")
 
@@ -43,6 +44,12 @@ class Experiment:
     tokens_in: int = 0
     tokens_out: int = 0
     ts: float = field(default_factory=time.time)
+    columns: list[str] = field(default_factory=list)  # исходные колонки, которых касается изменение
+    diff: str = ""                                    # сжатый дифф кода относительно базы
+    base_hash: str = ""                               # code_hash базы, от которой сделан эксперимент
+
+
+_FIELDS = {f.name for f in fields(Experiment)}
 
 
 def _num(value: float | None) -> str:
@@ -64,9 +71,10 @@ def _format(exp: Experiment) -> str:
 
 
 class ExperimentMemory:
-    def __init__(self) -> None:
+    def __init__(self, columns: Iterable[str] = ()) -> None:
         self.experiments: list[Experiment] = []
         self.notes: list[str] = []
+        self.columns: list[str] = [str(c) for c in columns]  # исходные колонки задачи — для дублей и покрытия
 
     def next_id(self) -> int:
         return len(self.experiments) + 1
@@ -130,3 +138,19 @@ class ExperimentMemory:
                        for k, v in asdict(exp).items()}
                 fh.write(json.dumps(row, ensure_ascii=False) + "\n")
         return path
+
+    @classmethod
+    def load_jsonl(cls, path: str | Path, columns: Iterable[str] = ()) -> "ExperimentMemory":
+        """Обратно к dump_jsonl; старый формат (без новых полей) и битые строки не мешают."""
+        memory = cls(columns)
+        path = Path(path)
+        if not path.exists():
+            return memory
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                row = json.loads(line)
+                exp = Experiment(**{k: v for k, v in row.items() if k in _FIELDS})
+                memory.add(exp)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+        return memory
