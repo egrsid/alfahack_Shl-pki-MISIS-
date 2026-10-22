@@ -103,6 +103,14 @@ def test_code_diff_long_is_clipped():
     assert len(code_diff(BASE, new, max_lines=0).splitlines()) == 40
 
 
+def test_code_diff_clipping_prefers_added_lines():
+    old = "def f():\n" + "".join(f"    old_{i} = {i}\n" for i in range(10))
+    new = "def f():\n    added = 1\n"
+    lines = code_diff(old, new, max_lines=3).splitlines()
+    assert lines[:3] == ["-    old_0 = 0", "-    old_1 = 1", "+    added = 1"]  # «+» не потерялся, порядок исходный
+    assert lines[3] == "... (+8 more changed lines)"
+
+
 def test_columns_in_uses_only_string_literals_of_known_columns():
     code = """df["floor_area"] / df['year_built']; x = 'id'; s = "floor_area_log"; # floor_area in comment
 spec.get("cat_cols"); df["it's"]"""

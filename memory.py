@@ -34,12 +34,18 @@ def _code_lines(code: str) -> list[str]:
     return [line.rstrip() for line in (code or "").splitlines() if line.strip()]
 
 
+def _prefer_added(lines: list[str], limit: int) -> list[str]:
+    """Не больше limit строк: сначала добавленные (+), потом удалённые; исходный порядок сохраняется."""
+    order = sorted(range(len(lines)), key=lambda i: (not lines[i].startswith("+"), i))[:limit]
+    return [lines[i] for i in sorted(order)]
+
+
 def code_diff(old: str, new: str, max_lines: int = 15) -> str:
-    """Только изменённые строки (+/-) без контекста; max_lines=0 — без обрезки."""
+    """Только изменённые строки (+/-) без контекста; при обрезке важнее добавленные. max_lines=0 — без обрезки."""
     changed = [line for line in difflib.unified_diff(_code_lines(old), _code_lines(new), lineterm="", n=0)
                if line[:1] in "+-" and not line.startswith(("+++", "---"))]
     if max_lines and len(changed) > max_lines:
-        changed = changed[:max_lines] + [f"... (+{len(changed) - max_lines} more changed lines)"]
+        changed = _prefer_added(changed, max_lines) + [f"... (+{len(changed) - max_lines} more changed lines)"]
     return "\n".join(changed)
 
 
@@ -195,8 +201,8 @@ def _failure_cause(error: str) -> str:
 
 
 def _diff_preview(diff: str, max_lines: int = 3) -> list[str]:
-    lines = [line for line in (diff or "").splitlines() if line.strip()]
-    preview = [_one_line(line, 100) for line in lines[:max_lines]]
+    lines = [line for line in (diff or "").splitlines() if line.strip() and not line.startswith("... (+")]
+    preview = [_one_line(line, 100) for line in _prefer_added(lines, max_lines)]
     return preview + ([f"... (+{len(lines) - max_lines} lines)"] if len(lines) > max_lines else [])
 
 
