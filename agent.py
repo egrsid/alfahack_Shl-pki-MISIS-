@@ -17,11 +17,16 @@ import json
 import logging
 import os
 import re
+import signal
+import subprocess
+import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
 import numpy as np
+import pandas as pd
 
 log = logging.getLogger("agent")
 
@@ -79,6 +84,7 @@ class AgentConfig:
     features_timeout: float = 300.0
     evaluate_timeout: float = 900.0
     max_feature_cols: int = 2000
+    max_feature_gb: float = 4.0         # размер признаков train в памяти
     max_nan_share: float = 0.5          # «NaN-лавина»: доля пропусков выше max(этого, входной + 0.25)
     max_repairs: int = 1                # попыток ремонта по traceback / ошибке проверки
     max_format_fixes: int = 1           # попыток «пришли один блок ```python»
@@ -371,6 +377,437 @@ def normalize_model_config(consts: dict, task_type: str) -> tuple[str, dict, str
         notes.append(f"TARGET_TRANSFORM={transform!r} is not supported for {task_type}, using None")
         transform = None
     return model, params, transform, notes
+
+
+# ============================================================ данные задачи
+
+@dataclass
+class TaskData:
+    train_x: pd.DataFrame  # признаки train без таргета, id и drop_cols — только это попадает в песочницу
+    test_x: pd.DataFrame
+    y: Any                 # таргет остаётся в процессе харнесса (нужен только для профиля)
+    spec_dict: dict        # что видит код LLM: тип, метрика, имя таргета, группы колонок, заметки
+    nan_share: float = 0.0
+
+
+def _targets(spec: Any) -> list[str]:
+    target = getattr(spec, "target", None)
+    return [target] if isinstance(target, str) else list(target or [])
+
+
+def spec_to_dict(spec: Any, columns: list[str]) -> dict:
+    cols = set(columns)
+    targets = _targets(spec)
+
+    def present(name: str) -> list[str]:
+        return [c for c in (getattr(spec, name, None) or []) if c in cols]
+
+    return {"task_type": str(getattr(spec, "task_type", "")), "metric": str(getattr(spec, "metric", "")),
+            "greater_is_better": bool(getattr(spec, "greater_is_better", False)),
+            "target": targets[0] if len(targets) == 1 else targets, "id_col": getattr(spec, "id_col", None),
+            "cat_cols": present("cat_cols"), "date_cols": present("date_cols"), "text_cols": present("text_cols"),
+            "feature_notes": {k: str(v)[:200] for k, v in (getattr(spec, "feature_notes", None) or {}).items()
+                              if k in cols}}
+
+
+def _find_file(spec: Any, name: str) -> Path:
+    """Файл задачи: поле spec.<stem>_path, каталог задачи или подкаталоги (в task.md пути бывают вложенные)."""
+    explicit = getattr(spec, f"{name.split('.')[0]}_path", None)
+    if explicit and Path(explicit).is_file():
+        return Path(explicit)
+    task_dir = Path(spec.task_dir)
+    if (task_dir / name).is_file():
+        return task_dir / name
+    found = sorted((p for p in task_dir.rglob(name) if ".agent_work" not in p.parts),
+                   key=lambda p: (len(p.parts), str(p)))
+    if not found:
+        raise FileNotFoundError(f"{name} not found in {task_dir}")
+    return found[0]
+
+
+def load_task_data(spec: Any) -> TaskData:
+    train = pd.read_csv(_find_file(spec, "train.csv"), low_memory=False)
+    test = pd.read_csv(_find_file(spec, "test.csv"), low_memory=False)
+    targets = _targets(spec)
+    drop = {getattr(spec, "id_col", None), *targets, *(getattr(spec, "drop_cols", None) or [])}
+    features = [c for c in test.columns if c in train.columns and c not in drop]
+    y = train[targets[0]] if len(targets) == 1 else train[targets]
+    train_x, test_x = train[features].reset_index(drop=True), test[features].reset_index(drop=True)
+    nan_share = float(train_x.isna().sum().sum() / train_x.size) if train_x.size else 0.0
+    return TaskData(train_x, test_x, y.reset_index(drop=True), spec_to_dict(spec, features), nan_share)
+
+
+def _mini_profile(data: TaskData) -> dict:
+    """Компактный профиль данных, пока нет eda.profile (P1): типы, пропуски, кардинальность, таргет."""
+    spec = data.spec_dict
+    columns = []
+    for name in data.train_x.columns:
+        series = data.train_x[name]
+        info: dict[str, Any] = {"name": name, "missing_pct": round(float(series.isna().mean()) * 100, 1),
+                                "nunique": int(series.nunique(dropna=True))}
+        if name in spec["date_cols"]:
+            info["dtype"] = "date"
+        elif name in spec["text_cols"]:
+            info["dtype"] = "text"
+        elif pd.api.types.is_bool_dtype(series):
+            info["dtype"] = "bool"
+        elif pd.api.types.is_numeric_dtype(series):
+            info.update(dtype="num", min=float(series.min()), max=float(series.max()))
+        else:
+            info.update(dtype="cat", top=series.value_counts().index[:3].astype(str).tolist())
+        columns.append(info)
+
+    target: dict[str, Any] = {"name": spec["target"]}
+    y = data.y
+    if isinstance(y, pd.Series) and spec["task_type"] == "regression" and pd.api.types.is_numeric_dtype(y):
+        target.update(mean=float(y.mean()), std=float(y.std()), min=float(y.min()), max=float(y.max()),
+                      skew=float(y.skew()), zeros_pct=round(float((y == 0).mean()) * 100, 1))
+    elif isinstance(y, pd.Series):
+        target["classes"] = {str(k): int(v) for k, v in y.astype(str).value_counts().head(15).items()}
+    return {"n_train": len(data.train_x), "n_test": len(data.test_x), "target": target, "columns": columns}
+
+
+def _parquet_safe(frame: pd.DataFrame) -> pd.DataFrame:
+    frame = frame.copy()
+    frame.columns = [str(c) for c in frame.columns]
+    for col in frame.columns:
+        if frame[col].dtype == object:  # смешанные типы в object pyarrow не пишет
+            frame[col] = frame[col].where(frame[col].isna(), frame[col].astype(str))
+    return frame
+
+
+def write_inputs(data: TaskData, workdir: Path) -> tuple[Path, Path]:
+    """Вход песочницы: признаки без таргета, id и drop_cols. Таргет в песочницу не попадает никогда."""
+    folder = Path(workdir) / "input"
+    folder.mkdir(parents=True, exist_ok=True)
+    paths = folder / "train_X.parquet", folder / "test_X.parquet"
+    _parquet_safe(data.train_x).to_parquet(paths[0], index=False)
+    _parquet_safe(data.test_x).to_parquet(paths[1], index=False)
+    return paths
+
+
+# базовый модуль («эксперимент 0»): исходные признаки + детерминированная подготовка дат и текста
+BASE_CODE = '''import numpy as np
+import pandas as pd
+
+
+def build_features(train, test, spec):
+    X_train, X_test = train.copy(), test.copy()
+    for df in (X_train, X_test):
+        for col in spec.get("date_cols", []):
+            if col in df.columns:
+                dates = pd.to_datetime(df[col], errors="coerce")
+                df[col + "_year"] = dates.dt.year
+                df[col + "_month"] = dates.dt.month
+                df[col + "_dayofweek"] = dates.dt.dayofweek
+                df.drop(columns=col, inplace=True)
+        for col in spec.get("text_cols", []):
+            if col in df.columns:
+                text = df[col].fillna("").astype(str)
+                df[col + "_len"] = text.str.len()
+                df[col + "_words"] = text.str.split().str.len()
+                df.drop(columns=col, inplace=True)
+    return X_train, X_test
+
+
+MODEL = "lightgbm"
+PARAMS = {}
+TARGET_TRANSFORM = None
+'''
+
+
+# ============================================================ песочница
+
+@dataclass
+class ExecResult:
+    stdout: str
+    stderr: str
+    returncode: int
+    artifacts: list[str] = field(default_factory=list)
+    timed_out: bool = False
+
+
+def _tail(path: Path, limit: int = 20_000) -> str:
+    if not path.exists():
+        return ""
+    with path.open("rb") as fh:
+        fh.seek(max(0, path.stat().st_size - limit))
+        return fh.read().decode("utf-8", errors="replace")
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)  # процесс в своей сессии: убиваем всю группу
+    except (AttributeError, ProcessLookupError, PermissionError, OSError):
+        proc.kill()
+
+
+def _local_run_code(code: str, cwd: Path, timeout: float) -> ExecResult:
+    """Запасная песочница, пока нет sandbox.py (P5): отдельный процесс, пустой env, таймаут."""
+    cwd = Path(cwd)
+    cwd.mkdir(parents=True, exist_ok=True)
+    (cwd / "_runner.py").write_text(code, encoding="utf-8")
+    env = {"PATH": os.defpath, "PYTHONIOENCODING": "utf-8", "PYTHONDONTWRITEBYTECODE": "1"}  # без OPENAI_*
+    with open(cwd / "stdout.txt", "wb") as out, open(cwd / "stderr.txt", "wb") as err:
+        proc = subprocess.Popen([sys.executable, "-I", "-u", "_runner.py"], cwd=cwd, env=env, stdout=out,
+                                stderr=err, stdin=subprocess.DEVNULL, start_new_session=True)
+        try:
+            proc.wait(timeout=timeout)
+            timed_out = False
+        except subprocess.TimeoutExpired:
+            _kill_tree(proc)
+            proc.wait()
+            timed_out = True
+    return ExecResult(_tail(cwd / "stdout.txt"), _tail(cwd / "stderr.txt"), proc.returncode,
+                      sorted(p.name for p in cwd.iterdir()), timed_out)
+
+
+RUNNER = '''"""Раннер эксперимента агента: строит признаки кодом LLM, результат — только через файлы."""
+import importlib.util
+import json
+import sys
+
+import pandas as pd
+
+
+def fail(message):
+    print("HARNESS_ERROR: " + message, file=sys.stderr)
+    sys.exit(3)
+
+
+def frame(name, value, n):
+    if isinstance(value, pd.Series):
+        value = value.to_frame()
+    if not isinstance(value, pd.DataFrame):
+        fail(f"{name} is {type(value).__name__}, expected a pandas DataFrame")
+    if len(value) != n:
+        fail(f"{name} has {len(value)} rows, expected {n}: rows must not be added or dropped")
+    if not value.index.equals(pd.RangeIndex(n)):
+        try:
+            same_rows = value.index.is_unique and set(value.index) == set(range(n))
+        except TypeError:
+            same_rows = False
+        if same_rows:
+            fail(f"rows of {name} were reordered: keep the original row order")
+        value = value.reset_index(drop=True)
+    value.columns = [str(c) for c in value.columns]
+    duplicated = value.columns[value.columns.duplicated()].tolist()
+    if duplicated:
+        fail(f"{name} has duplicated column names: {duplicated[:10]}")
+    for col in value.columns:
+        if value[col].dtype == object:
+            value[col] = value[col].where(value[col].isna(), value[col].astype(str))
+    return value
+
+
+def main():
+    with open("spec.json", encoding="utf-8") as fh:
+        spec = json.load(fh)
+    train = pd.read_parquet(__TRAIN__)
+    test = pd.read_parquet(__TEST__)
+    n_train, n_test = len(train), len(test)
+    loader = importlib.util.spec_from_file_location("features", "features.py")
+    module = importlib.util.module_from_spec(loader)
+    loader.loader.exec_module(module)
+    result = module.build_features(train, test, spec)
+    if not (isinstance(result, tuple) and len(result) == 2):
+        fail("build_features must return a tuple (X_train, X_test)")
+    frame("X_train", result[0], n_train).to_parquet("feat_train.parquet")
+    frame("X_test", result[1], n_test).to_parquet("feat_test.parquet")
+
+
+main()
+'''
+
+
+@dataclass
+class FeatureOutcome:
+    x_train: pd.DataFrame | None = None
+    x_test: pd.DataFrame | None = None
+    error: str = ""
+    notes: list[str] = field(default_factory=list)
+    seconds: float = 0.0
+    timed_out: bool = False
+
+
+def run_features(code: str, exp_dir: Path, inputs: tuple[Path, Path], data: TaskData, cfg: AgentConfig,
+                 run_code: RunCodeFn, timeout: float) -> FeatureOutcome:
+    """Построить признаки кодом LLM в песочнице и проверить результат харнессом."""
+    exp_dir = Path(exp_dir)
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    outputs = exp_dir / "feat_train.parquet", exp_dir / "feat_test.parquet"
+    for path in outputs:
+        path.unlink(missing_ok=True)
+    (exp_dir / "features.py").write_text(code, encoding="utf-8")
+    (exp_dir / "spec.json").write_text(json.dumps(data.spec_dict, ensure_ascii=False, default=str),
+                                       encoding="utf-8")
+    runner = RUNNER.replace("__TRAIN__", repr(str(inputs[0]))).replace("__TEST__", repr(str(inputs[1])))
+
+    start = time.monotonic()
+    try:
+        result = run_code(runner, exp_dir, timeout)
+    except Exception as error:  # сбой самой песочницы — не повод ронять агента
+        return FeatureOutcome(error=f"sandbox error: {type(error).__name__}: {error}",
+                              seconds=time.monotonic() - start)
+    seconds = time.monotonic() - start
+    if getattr(result, "timed_out", False):
+        return FeatureOutcome(error=f"timeout: building features took longer than {timeout:.0f} s; "
+                                    "the code is too slow or too heavy", seconds=seconds, timed_out=True)
+    stderr = str(getattr(result, "stderr", "") or "")
+    if getattr(result, "returncode", 1) != 0 or not all(p.exists() for p in outputs):
+        harness = [line for line in stderr.splitlines() if line.startswith("HARNESS_ERROR: ")]
+        error = (harness[-1].removeprefix("HARNESS_ERROR: ") if harness
+                 else stderr.strip()[-4000:] or f"process exited with code {getattr(result, 'returncode', '?')}")
+        return FeatureOutcome(error=error, seconds=seconds)
+    try:
+        x_train, x_test = pd.read_parquet(outputs[0]), pd.read_parquet(outputs[1])
+    except Exception as error:
+        return FeatureOutcome(error=f"cannot read features: {type(error).__name__}: {error}", seconds=seconds)
+    finally:
+        if not cfg.keep_artifacts:
+            for path in outputs:
+                path.unlink(missing_ok=True)
+    x_train, x_test, problems, notes = validate_features(x_train, x_test, data, cfg)
+    if problems:
+        return FeatureOutcome(error="; ".join(problems), notes=notes, seconds=seconds)
+    return FeatureOutcome(x_train, x_test, notes=notes, seconds=seconds)
+
+
+def _to_float(series: pd.Series) -> pd.Series:
+    try:
+        return series.astype("float64")
+    except (TypeError, ValueError):
+        return pd.to_numeric(series, errors="coerce").astype("float64")
+
+
+def _to_seconds(series: pd.Series) -> pd.Series:
+    if pd.api.types.is_timedelta64_dtype(series):
+        return series.dt.total_seconds()
+    epoch = pd.Timestamp("1970-01-01", tz=getattr(series.dt, "tz", None))
+    return (series - epoch).dt.total_seconds()
+
+
+def _as_category(a: pd.Series, b: pd.Series) -> tuple[pd.Series, pd.Series]:
+    """Строки/категории → category с общим словарём для train и test."""
+    a, b = a.astype(object), b.astype(object)
+    a, b = a.where(a.isna(), a.astype(str)), b.where(b.isna(), b.astype(str))
+    dtype = pd.CategoricalDtype(sorted(pd.unique(pd.concat([a, b]).dropna())))
+    return a.astype(dtype), b.astype(dtype)
+
+
+def _looks_like_row_index(values: np.ndarray) -> bool:
+    """Арифметическая прогрессия по строкам (arange, номер строки, cumcount по всем) — утечка через порядок."""
+    if len(values) < 100 or np.isnan(values).any():
+        return False
+    step = np.diff(values)
+    return bool(step[0] != 0 and np.all(step == step[0]))
+
+
+def validate_features(x_train: pd.DataFrame, x_test: pd.DataFrame, data: TaskData,
+                      cfg: AgentConfig) -> tuple[pd.DataFrame, pd.DataFrame, list[str], list[str]]:
+    """Проверка выхода build_features и приведение типов для бустинга. problems непусто → эксперимент failed."""
+    problems: list[str] = []
+    notes: list[str] = []
+    if len(x_train) != len(data.train_x) or len(x_test) != len(data.test_x):
+        problems.append(f"row count changed: got {len(x_train)}/{len(x_test)}, "
+                        f"expected {len(data.train_x)}/{len(data.test_x)}")
+    if set(x_train.columns) != set(x_test.columns):
+        only_train = [c for c in x_train.columns if c not in x_test.columns][:10]
+        only_test = [c for c in x_test.columns if c not in x_train.columns][:10]
+        problems.append(f"train/test columns differ: only in train {only_train}, only in test {only_test}")
+    if not 0 < x_train.shape[1] <= cfg.max_feature_cols:
+        problems.append(f"{x_train.shape[1]} feature columns, allowed 1..{cfg.max_feature_cols}")
+    forbidden = [c for c in x_train.columns if c in {*_as_list(data.spec_dict["target"]), data.spec_dict["id_col"]}]
+    if forbidden:
+        problems.append(f"target/id columns must not be features: {forbidden}")
+    if problems:
+        return x_train, x_test, problems, notes
+    if not x_train.index.equals(pd.RangeIndex(len(x_train))):
+        x_train = x_train.reset_index(drop=True)
+    if not x_test.index.equals(pd.RangeIndex(len(x_test))):
+        x_test = x_test.reset_index(drop=True)
+
+    nan_share = sum(int(x_train[c].isna().sum()) for c in x_train.columns) / max(1, x_train.size)
+    if nan_share > max(cfg.max_nan_share, data.nan_share + 0.25):
+        problems.append(f"NaN avalanche: {nan_share:.0%} of feature values are missing "
+                        f"(input had {data.nan_share:.0%})")
+
+    out_train, out_test = {}, {}
+    inf_cols, index_cols, constant, bad = [], [], [], []
+    for col in x_train.columns:
+        a, b = x_train[col], x_test[col]
+        if pd.api.types.is_datetime64_any_dtype(a) or pd.api.types.is_timedelta64_dtype(a):
+            a = _to_seconds(a)
+            if pd.api.types.is_datetime64_any_dtype(b) or pd.api.types.is_timedelta64_dtype(b):
+                b = _to_seconds(b)
+            notes.append(f"{col}: datetime converted to seconds")
+        if pd.api.types.is_bool_dtype(a) or (pd.api.types.is_extension_array_dtype(a)
+                                             and pd.api.types.is_numeric_dtype(a)):
+            a = _to_float(a)
+        if pd.api.types.is_bool_dtype(b) or (pd.api.types.is_extension_array_dtype(b)
+                                             and pd.api.types.is_numeric_dtype(b)):
+            b = _to_float(b)
+
+        numeric = pd.api.types.is_numeric_dtype(a)
+        if numeric != pd.api.types.is_numeric_dtype(b) or pd.api.types.is_complex_dtype(a):
+            bad.append(f"{col} ({a.dtype} in train, {b.dtype} in test)")
+            continue
+        if numeric:
+            values = a.to_numpy(dtype="float64", na_value=np.nan)
+            if np.isinf(values).any() or np.isinf(b.to_numpy(dtype="float64", na_value=np.nan)).any():
+                inf_cols.append(col)
+            elif col not in data.train_x.columns and _looks_like_row_index(values):
+                index_cols.append(col)
+        elif isinstance(a.dtype, pd.CategoricalDtype) or a.dtype == object or pd.api.types.is_string_dtype(a):
+            a, b = _as_category(a, b)
+        else:
+            bad.append(f"{col} ({a.dtype})")
+            continue
+        if a.nunique(dropna=False) <= 1:
+            constant.append(col)
+            continue
+        out_train[col], out_test[col] = a, b
+
+    if bad:
+        problems.append(f"unsupported or mismatched dtypes: {bad[:10]}")
+    if inf_cols:
+        problems.append(f"inf values in columns {inf_cols[:10]}: replace them with NaN")
+    if index_cols:
+        problems.append(f"columns {index_cols[:10]} look like a row index/ID: row position must not be a feature")
+    if constant:
+        notes.append(f"dropped constant columns: {constant[:10]}")
+    if not out_train and not problems:
+        problems.append("all feature columns are constant")
+    x_train = pd.DataFrame(out_train, index=pd.RangeIndex(len(x_train)))
+    x_test = pd.DataFrame(out_test, index=pd.RangeIndex(len(x_test)))
+    if x_train.memory_usage(deep=False).sum() > cfg.max_feature_gb * 1e9:
+        problems.append(f"features use more than {cfg.max_feature_gb} GB")
+    return x_train, x_test, problems, notes
+
+
+def _as_list(value: Any) -> list:
+    return list(value) if isinstance(value, (list, tuple)) else [value]
+
+
+# ============================================================ адаптер к evaluator.evaluate
+
+def _rows_like(features: pd.DataFrame, frame: Any) -> pd.DataFrame:
+    """Признаки под строки, которые evaluator передал в build_features (весь набор или его часть)."""
+    if not isinstance(frame, pd.DataFrame) or len(frame) == len(features):
+        return features.copy()
+    try:  # часть train (например, без hold-out P1) с исходными номерами строк в индексе
+        return features.loc[frame.index].copy()
+    except KeyError as error:
+        raise ValueError(f"evaluator passed {len(frame)} rows that cannot be matched to {len(features)} "
+                         "precomputed feature rows") from error
+
+
+def make_build_features(x_train: pd.DataFrame, x_test: pd.DataFrame) -> Callable:
+    """build_features для evaluator.evaluate: код LLM уже исполнен в песочнице, отдаём готовые признаки."""
+    def build_features(train: Any, test: Any, spec: Any) -> tuple[pd.DataFrame, pd.DataFrame]:
+        return _rows_like(x_train, train), _rows_like(x_test, test)
+
+    return build_features
 
 
 def research(spec: Any, best: Candidate | None, llm: LLMClient | None, deadline: Any, *,
