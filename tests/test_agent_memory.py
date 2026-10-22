@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from memory import Experiment, ExperimentMemory, code_hash, normalize_title
+from memory import Experiment, ExperimentMemory, code_diff, code_hash, columns_in, normalize_title
 
 
 def exp(memory, title, status="rejected", **kw):
@@ -82,3 +82,29 @@ def test_load_jsonl_roundtrip_new_and_old_format(tmp_path):
     assert loaded.experiments[2].columns == [] and loaded.experiments[2].diff == ""
     assert loaded.columns == ["a", "b"] and loaded.next_id() == 4
     assert ExperimentMemory.load_jsonl(tmp_path / "missing.jsonl").experiments == []
+
+
+BASE = 'def build_features(train, test, spec):\n    X = train.copy()\n\n    return X, test\n'
+
+
+def test_code_diff_shows_only_changed_lines():
+    new = BASE.replace("    return", '    X["a_b"] = X["a"] / X["b"].replace(0, np.nan)\n    return')
+    assert code_diff(BASE, new) == '+    X["a_b"] = X["a"] / X["b"].replace(0, np.nan)'
+    assert code_diff(BASE, BASE + "\n\n   \n") == ""  # пустые строки и хвостовые пробелы не изменение
+    renamed = new.replace("X =", "frame =")
+    assert code_diff(new, renamed).splitlines() == ["-    X = train.copy()", "+    frame = train.copy()"]
+
+
+def test_code_diff_long_is_clipped():
+    new = BASE.replace("    return", "".join(f'    X["f{i}"] = {i}\n' for i in range(40)) + "    return")
+    lines = code_diff(BASE, new, max_lines=5).splitlines()
+    assert len(lines) == 6 and lines[-1] == "... (+35 more changed lines)"
+    assert len(code_diff(BASE, new, max_lines=0).splitlines()) == 40
+
+
+def test_columns_in_uses_only_string_literals_of_known_columns():
+    code = """df["floor_area"] / df['year_built']; x = 'id'; s = "floor_area_log"; # floor_area in comment
+spec.get("cat_cols"); df["it's"]"""
+    known = ["floor_area", "year_built", "id", "facility_type", "it's"]
+    assert columns_in(code, known) == ["floor_area", "year_built", "id", "it's"]
+    assert columns_in("", known) == [] and columns_in(code, []) == []

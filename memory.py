@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import math
@@ -27,6 +28,29 @@ def code_hash(code: str) -> str:
 
 def normalize_title(title: str) -> str:
     return re.sub(r"[\W_]+", " ", title.lower()).strip()
+
+
+def _code_lines(code: str) -> list[str]:
+    return [line.rstrip() for line in (code or "").splitlines() if line.strip()]
+
+
+def code_diff(old: str, new: str, max_lines: int = 15) -> str:
+    """Только изменённые строки (+/-) без контекста; max_lines=0 — без обрезки."""
+    changed = [line for line in difflib.unified_diff(_code_lines(old), _code_lines(new), lineterm="", n=0)
+               if line[:1] in "+-" and not line.startswith(("+++", "---"))]
+    if max_lines and len(changed) > max_lines:
+        changed = changed[:max_lines] + [f"... (+{len(changed) - max_lines} more changed lines)"]
+    return "\n".join(changed)
+
+
+_STRING_LITERAL = re.compile(r"""(['"])((?:\\.|(?!\1).)*)\1""")
+
+
+def columns_in(code: str, known: Iterable[str]) -> list[str]:
+    """Известные колонки, упомянутые в коде строковыми литералами (df["col"]), в порядке появления."""
+    known = set(known)
+    found = (match.group(2) for match in _STRING_LITERAL.finditer(code or ""))
+    return list(dict.fromkeys(name for name in found if name in known))
 
 
 @dataclass
