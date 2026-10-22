@@ -161,6 +161,36 @@ def test_duplicate_code_is_not_rerun(reg_task):
     assert evaluator.calls == 3  # fallback из теста + эталон + первый эксперимент
 
 
+# ---------------------------------------------------------------- рассуждающая модель (qwen3.8)
+
+class BadRequest(Exception):
+    status_code = 400
+
+
+def test_empty_answer_is_retried_with_more_tokens(reg_task):
+    llm = MockLLM({"planner": [plan("Interaction x1*x2")], "coder": ["", fenced(GOOD_CODE)]})
+    result, _, _ = run_research(reg_task, llm, code_max_tokens=1000)
+    assert len(result) == 1
+    assert [kw["max_tokens"] for role, _, kw in llm.calls if role == "coder"] == [1000, 2500]
+
+
+def test_reasoning_hint_is_dropped_after_bad_request(reg_task):
+    llm = MockLLM({"planner": [BadRequest("unknown field: reasoning"), plan("Interaction x1*x2")],
+                   "coder": [fenced(GOOD_CODE)]})
+    result, _, _ = run_research(reg_task, llm)
+    kws = [kw for _, _, kw in llm.calls]
+    assert len(result) == 1
+    assert kws[0]["extra_body"] == {"reasoning": {"enabled": False}}
+    assert all("extra_body" not in kw for kw in kws[1:])
+
+
+def test_budget_error_with_status_400_still_stops(reg_task):
+    llm = MockLLM({"planner": [plan("Interaction x1*x2", "Scaled x3")],
+                   "coder": [fenced(GOOD_CODE), BadRequest("Budget has been exceeded")]})
+    result, _, _ = run_research(reg_task, llm)
+    assert len(result) == 1 and llm.count("coder") == 2 and llm.count("planner") == 1
+
+
 # ---------------------------------------------------------------- стоп-критерии
 
 def test_llm_unavailable_mid_run_returns_accumulated(reg_task):

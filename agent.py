@@ -101,14 +101,18 @@ class AgentConfig:
     suspicious_k: float = 8.0           # «чудесный» скачок: gain > suspicious_k · SE ...
     suspicious_rel: float = 0.1         # ... и > 10% от |cv| → перепроверка guards
     only_better_than_best: bool = True  # вернуть только кандидатов не хуже входного best
-    # LLM
-    plan_max_tokens: int = 1200
+    # LLM. qwen3.8-27b — рассуждающая модель: скрытое рассуждение тратит max_tokens, поэтому потолки с запасом
+    plan_max_tokens: int = 3000
     plan_temperature: float = 0.7
-    code_max_tokens: int = 2000
+    code_max_tokens: int = 4000
     code_temperature: float = 0.2
-    critic_max_tokens: int = 300
+    critic_max_tokens: int = 1200
     use_critic: bool = True
     no_think: bool = True               # дописывать /no_think (Qwen3: без длинного <think>)
+    # подсказка шлюзу «без рассуждения» (формат OpenRouter); идёт в **kw клиента, после ответа 400 не передаём
+    llm_extra: dict = field(default_factory=lambda: {"extra_body": {"reasoning": {"enabled": False}}})
+    empty_retry_factor: float = 2.5     # пустой ответ (лимит ушёл на рассуждение) → 1 повтор с max_tokens × это
+    max_answer_tokens: int = 10_000
     # размеры кусков промпта, символы
     profile_chars: int = 5000
     task_text_chars: int = 1200
@@ -941,6 +945,14 @@ def _is_budget_error(error: Exception) -> bool:
     return "budget" in text and "exceed" in text
 
 
+def _is_bad_request(error: Exception) -> bool:
+    """Шлюз отверг параметры запроса (HTTP 400/422), а не упал сам."""
+    for source in (error, getattr(error, "response", None)):
+        if getattr(source, "status_code", None) in (400, 422):
+            return True
+    return False
+
+
 def _no_think(messages: list[dict]) -> list[dict]:
     """Qwen3: «/no_think» в последнем сообщении пользователя отключает длинный <think>."""
     messages = [dict(m) for m in messages]
@@ -1024,6 +1036,7 @@ class _Research:
         self.current: Candidate | None = None
         self.base_code = BASE_CODE
         self.insights = ""
+        self.llm_extra = dict(cfg.llm_extra)
         self.tokens_in = self.tokens_out = self.llm_calls = 0
         self.iteration = self.consecutive_failures = self.no_improve = self.empty_plans = self.since_critic = 0
         self.durations: list[float] = []
@@ -1156,8 +1169,30 @@ class _Research:
 
     # ---------------------------------------------------------------- LLM
     def _llm(self, method: str, messages: list[dict], *args: Any, **kw: Any) -> Any:
-        if self.cfg.no_think:
+        """Вызов LLM: подсказка «без рассуждения», откат без неё при 400, повтор при пустом ответе."""
+        cfg = self.cfg
+        if cfg.no_think:
             messages = _no_think(messages)
+        extra = dict(self.llm_extra)
+        try:
+            result = self._llm_once(method, messages, *args, **{**extra, **kw})
+        except LLMUnavailable:
+            raise
+        except Exception as error:
+            if not (extra and _is_bad_request(error)):
+                raise
+            log.info("research: gateway rejected %s (%s), calling without it", sorted(extra),
+                     P.clip(str(error), 200))
+            self.llm_extra = {}
+            result = self._llm_once(method, messages, *args, **kw)
+        if method == "chat" and not strip_think(result) and kw.get("max_tokens"):
+            kw["max_tokens"] = min(cfg.max_answer_tokens, int(kw["max_tokens"] * cfg.empty_retry_factor))
+            log.info("research: empty answer (reasoning used the token limit?), retry with max_tokens=%d",
+                     kw["max_tokens"])
+            result = self._llm_once(method, messages, *args, **{**self.llm_extra, **kw})
+        return result
+
+    def _llm_once(self, method: str, messages: list[dict], *args: Any, **kw: Any) -> Any:
         before, result = _read_usage(self.llm), None
         try:
             result = _call(getattr(self.llm, method), messages, *args, **kw)
