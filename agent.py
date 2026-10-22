@@ -11,9 +11,12 @@ eda, guards) подключаются через адаптеры ниже, по
 
 from __future__ import annotations
 
+import ast
 import importlib
+import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
@@ -110,6 +113,264 @@ def _optional(module: str, attr: str) -> Any:
         return getattr(importlib.import_module(module), attr, None)
     except ImportError:
         return None
+
+
+# ============================================================ парсинг ответов LLM
+
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.S | re.I)
+_THINK_TAG = re.compile(r"</?think>", re.I)
+_FENCE = re.compile(r"```[ \t]*([\w+-]*)[^\n]*\n(.*?)(?:```|\Z)", re.S)
+
+
+def strip_think(text: str | None) -> str:
+    """Убрать рассуждения Qwen. Незакрытый <think> (ответ обрезан) — убрать только тег."""
+    return _THINK_TAG.sub("", _THINK_BLOCK.sub("", text or "")).strip()
+
+
+def extract_code(text: str | None) -> str | None:
+    """Код из ответа кодера: первый блок ```python с build_features, иначе первый python-блок.
+
+    Без ограждений — текст от первого import/def, если в нём есть build_features.
+    Незакрытый блок (ответ обрезан по max_tokens) берётся до конца: дальше решит compile().
+    """
+    text = strip_think(text)
+    blocks = [body for lang, body in _FENCE.findall(text) if lang.lower() in ("python", "py", "python3", "")]
+    for body in blocks:
+        if "def build_features" in body:
+            return body.strip() + "\n"
+    if blocks and blocks[0].strip():
+        return blocks[0].strip() + "\n"
+    if "def build_features" in text:
+        start = re.search(r"^(import |from |def )", text, re.M)
+        return text[start.start():].strip() + "\n" if start else None
+    return None
+
+
+def _clean_json(text: str) -> str:
+    """Убрать //, /* */ и # комментарии вне строк и висячие запятые."""
+    out, i, in_str = [], 0, False
+    while i < len(text):
+        ch = text[i]
+        if in_str:
+            out.append(ch)
+            if ch == "\\" and i + 1 < len(text):
+                out.append(text[i + 1])
+                i += 1
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+            out.append(ch)
+        elif text.startswith("//", i) or ch == "#":
+            end = text.find("\n", i)
+            i = len(text) if end < 0 else end
+            continue
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            i = len(text) if end < 0 else end + 2
+            continue
+        else:
+            out.append(ch)
+        i += 1
+    return re.sub(r",\s*([}\]])", r"\1", "".join(out))
+
+
+def _balanced(text: str, start: int) -> str | None:
+    """Подстрока от открывающей скобки до парной (с учётом строк в обеих кавычках)."""
+    depth, quote, i = 0, "", start
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == "\\":
+                i += 1
+            elif ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+        elif ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+        i += 1
+    return None
+
+
+def _is_payload(value: Any) -> bool:
+    """Ответ — объект или список объектов (а не случайный «[1]» из текста вокруг)."""
+    return isinstance(value, dict) or (isinstance(value, list) and any(isinstance(v, dict) for v in value))
+
+
+def _first_json(text: str) -> Any:
+    decoder = json.JSONDecoder()
+    starts = [i for i, ch in enumerate(text) if ch in "{["][:50]
+    for i in starts:
+        for variant in (text[i:], _clean_json(text[i:])):
+            try:
+                value = decoder.raw_decode(variant)[0]
+                if _is_payload(value):
+                    return value
+            except json.JSONDecodeError:
+                pass
+        chunk = _balanced(text, i)
+        if chunk:  # одинарные кавычки, True/False/None — как питоновский литерал
+            pythonish = re.sub(r"\btrue\b", "True", re.sub(r"\bfalse\b", "False", re.sub(r"\bnull\b", "None", chunk)))
+            try:
+                value = ast.literal_eval(_clean_json(pythonish))
+                if _is_payload(value):
+                    return value
+            except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+                pass
+    return None
+
+
+def extract_json(text: str | None) -> Any:
+    """Первый JSON-объект/массив в ответе: сначала из ```json блоков, потом из всего текста."""
+    text = strip_think(text)
+    fenced = [body for lang, body in _FENCE.findall(text) if lang.lower() in ("json", "")]
+    for chunk in [*fenced, text]:
+        value = _first_json(chunk)
+        if value is not None:
+            return value
+    raise ValueError("no JSON object found in the answer")
+
+
+# ============================================================ статическая проверка кода
+
+ALLOWED_IMPORTS = {"numpy", "pandas", "scipy", "sklearn", "math", "re", "itertools", "functools", "collections",
+                   "datetime", "statistics", "string", "typing", "warnings", "operator", "calendar",
+                   "unicodedata", "heapq", "bisect", "__future__"}
+FORBIDDEN_NAMES = {"open", "exec", "eval", "compile", "__import__", "globals", "locals", "vars", "getattr",
+                   "setattr", "delattr", "breakpoint", "input", "exit", "quit", "help", "memoryview"}
+FORBIDDEN_ATTRS = {"to_csv", "to_parquet", "to_pickle", "to_json", "to_excel", "to_hdf", "to_sql", "to_feather",
+                   "to_stata", "to_orc", "to_clipboard", "tofile", "fromfile", "save", "savez", "savez_compressed",
+                   "savetxt", "load", "loadtxt", "genfromtxt", "fromregex", "memmap", "system", "popen", "remove",
+                   "unlink", "rmtree", "chdir"}
+_TOP_LEVEL_OK = (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.Assign, ast.AnnAssign)
+
+
+def validate_code(code: str) -> list[str]:
+    """Проблемы кода кодера без его исполнения; пустой список — можно запускать в песочнице."""
+    try:
+        tree = ast.parse(code)
+        compile(tree, "<features>", "exec")
+    except SyntaxError as error:
+        return [f"SyntaxError: {error.msg} (line {error.lineno})"]
+    except (ValueError, MemoryError, RecursionError) as error:
+        return [f"code does not compile: {error}"]
+
+    problems: list[str] = []
+    func = next((n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "build_features"), None)
+    if func is None:
+        problems.append("no top-level function `build_features(train, test, spec)`")
+    elif len(func.args.posonlyargs) + len(func.args.args) < 3 and func.args.vararg is None:
+        problems.append("`build_features` must accept three arguments: (train, test, spec)")
+
+    for node in tree.body:
+        docstring = isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
+        if not isinstance(node, _TOP_LEVEL_OK) and not docstring:
+            problems.append(f"top-level `{type(node).__name__}` statement (line {node.lineno}) is not allowed: "
+                            "only imports, functions and constants at module level")
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            if isinstance(node, ast.ImportFrom) and node.level:
+                problems.append("relative imports are not allowed")
+                continue
+            names = [node.module or ""] if isinstance(node, ast.ImportFrom) else [a.name for a in node.names]
+            for name in names:
+                if name.split(".")[0] not in ALLOWED_IMPORTS:
+                    problems.append(f"import of `{name}` is not allowed (allowed: numpy, pandas, scipy, sklearn, "
+                                    "math, re, collections, itertools, ...)")
+        elif isinstance(node, ast.Name) and (node.id in FORBIDDEN_NAMES or node.id.startswith("__")):
+            problems.append(f"use of `{node.id}` is not allowed")
+        elif isinstance(node, ast.Attribute):
+            if node.attr.startswith("__") and node.attr.endswith("__"):
+                problems.append(f"access to dunder attribute `{node.attr}` is not allowed")
+            elif node.attr in FORBIDDEN_ATTRS or node.attr.startswith("read_"):
+                problems.append(f"`.{node.attr}` is not allowed: no file, network or OS access")
+    return list(dict.fromkeys(problems))
+
+
+# белый список гиперпараметров: (min, max) — число в границах; set — одно из значений
+MODELS = ("lightgbm", "catboost", "xgboost")
+MODEL_PARAMS: dict[str, dict[str, Any]] = {
+    "lightgbm": {"n_estimators": (10, 5000), "learning_rate": (1e-3, 0.5), "num_leaves": (2, 1024),
+                 "max_depth": (-1, 16), "min_child_samples": (1, 10_000), "min_child_weight": (0.0, 1e3),
+                 "subsample": (0.1, 1.0), "subsample_freq": (0, 10), "colsample_bytree": (0.1, 1.0),
+                 "reg_alpha": (0.0, 1e3), "reg_lambda": (0.0, 1e3), "min_split_gain": (0.0, 10.0),
+                 "max_bin": (15, 1023), "cat_smooth": (0.0, 1e3), "cat_l2": (0.0, 1e3),
+                 "max_cat_threshold": (1, 1024), "min_data_per_group": (1, 10_000), "path_smooth": (0.0, 1e3),
+                 "class_weight": {"balanced", None}, "extra_trees": {True, False}},
+    "catboost": {"iterations": (10, 5000), "learning_rate": (1e-3, 0.5), "depth": (1, 10),
+                 "l2_leaf_reg": (0.0, 1e3), "random_strength": (0.0, 100.0), "bagging_temperature": (0.0, 100.0),
+                 "border_count": (16, 1024), "one_hot_max_size": (1, 255), "min_data_in_leaf": (1, 10_000),
+                 "auto_class_weights": {"Balanced", "SqrtBalanced", None}},
+    "xgboost": {"n_estimators": (10, 5000), "learning_rate": (1e-3, 0.5), "max_depth": (1, 16),
+                "min_child_weight": (0.0, 1e3), "subsample": (0.1, 1.0), "colsample_bytree": (0.1, 1.0),
+                "reg_alpha": (0.0, 1e3), "reg_lambda": (0.0, 1e3), "gamma": (0.0, 100.0), "max_bin": (16, 1024),
+                "max_cat_to_onehot": (1, 255)},
+}
+CONSTANTS = ("MODEL", "PARAMS", "TARGET_TRANSFORM")
+
+
+def extract_constants(code: str) -> tuple[dict, list[str]]:
+    """MODEL / PARAMS / TARGET_TRANSFORM из кода статически (ast.literal_eval), без исполнения."""
+    found: dict = {}
+    problems: list[str] = []
+    for node in ast.parse(code).body:
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = [node.target], node.value
+        else:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name) and target.id in CONSTANTS:
+                try:
+                    found[target.id] = ast.literal_eval(value)
+                except (ValueError, SyntaxError, TypeError):
+                    problems.append(f"{target.id} must be a literal value (no expressions or calls)")
+    return found, problems
+
+
+def normalize_model_config(consts: dict, task_type: str) -> tuple[str, dict, str | None, list[str]]:
+    """Привести MODEL/PARAMS/TARGET_TRANSFORM к белому списку; что выкинуто — в notes."""
+    notes: list[str] = []
+    model = str(consts.get("MODEL") or "lightgbm").lower().strip()
+    if model not in MODELS:
+        notes.append(f"MODEL={model!r} is not supported, using lightgbm")
+        model = "lightgbm"
+
+    raw = consts.get("PARAMS") or {}
+    if not isinstance(raw, dict):
+        notes.append("PARAMS must be a dict, ignored")
+        raw = {}
+    allowed, params = MODEL_PARAMS[model], {}
+    for key, value in raw.items():
+        rule = allowed.get(key)
+        if rule is None:
+            notes.append(f"PARAMS[{key!r}] is not allowed for {model}, ignored")
+        elif isinstance(rule, set):
+            if value in rule:
+                params[key] = value
+            else:
+                notes.append(f"PARAMS[{key!r}]={value!r} must be one of {sorted(rule, key=str)}, ignored")
+        elif isinstance(value, bool) or not isinstance(value, (int, float)):
+            notes.append(f"PARAMS[{key!r}] must be a number, ignored")
+        else:
+            low, high = rule
+            clipped = min(max(value, low), high)
+            if clipped != value:
+                notes.append(f"PARAMS[{key!r}]={value} clipped to {clipped}")
+            params[key] = int(round(clipped)) if isinstance(low, int) and isinstance(high, int) else float(clipped)
+
+    transform = consts.get("TARGET_TRANSFORM")
+    if transform is not None and (transform != "log1p" or task_type != "regression"):
+        notes.append(f"TARGET_TRANSFORM={transform!r} is not supported for {task_type}, using None")
+        transform = None
+    return model, params, transform, notes
 
 
 def research(spec: Any, best: Candidate | None, llm: LLMClient | None, deadline: Any, *,
