@@ -183,6 +183,23 @@ def test_experiment_records_diff_columns_and_base(reg_task):
     assert rows[1]["columns"] == ["x3"] and "x1_x2" not in rows[1]["diff"]
 
 
+def test_rephrased_rejected_hypothesis_is_not_rerun(reg_task):
+    llm = MockLLM({"planner": [plan("Count encoding of city", kind="encoding"),
+                               plan("Frequency encoding for city", "Interaction x1*x2", kind="encoding")],
+                   "coder": [fenced(useless_code("city_count")), fenced(GOOD_CODE)]})
+    result, _, _ = run_research(reg_task, llm)
+    rows = experiments(reg_task)
+    assert [r["hypothesis"] for r in rows] == ["Count encoding of city", "Interaction x1*x2"]
+    assert rows[0]["status"] == "rejected" and len(result) == 1 and llm.count("coder") == 2
+
+
+def test_rephrased_duplicates_within_one_plan_are_dropped(reg_task):
+    llm = MockLLM({"planner": [plan("Interaction x1*x2", "x1 times x2 interaction", "Scaled x3")],
+                   "coder": [fenced(GOOD_CODE), fenced(GOOD_ON_TOP)]})
+    run_research(reg_task, llm)
+    assert [r["hypothesis"] for r in experiments(reg_task)] == ["Interaction x1*x2", "Scaled x3"]
+
+
 # ---------------------------------------------------------------- рассуждающая модель (qwen3.8)
 
 class BadRequest(Exception):

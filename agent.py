@@ -986,8 +986,12 @@ _LEVELS = {"low": 1, "mid": 2, "high": 3}
 _LEVEL_ALIASES = {"medium": "mid", "moderate": "mid", "med": "mid"}
 
 
-def normalize_hypotheses(data: Any, task_type: str, tried: list[str], max_n: int) -> tuple[list[Hypothesis], str]:
-    """Ответ планировщика → гипотезы без повторов (с памятью и между собой), по убыванию выигрыш/стоимость."""
+def normalize_hypotheses(data: Any, task_type: str, tried: list[str], max_n: int,
+                         is_duplicate: Callable[[str, str], bool] | None = None) -> tuple[list[Hypothesis], str]:
+    """Ответ планировщика → гипотезы без повторов (с памятью и между собой), по убыванию выигрыш/стоимость.
+
+    tried — точные повторы названий; is_duplicate(title, kind) — повторы по смыслу (перефразированные).
+    """
     analysis, items = "", data
     if isinstance(data, dict):
         analysis = str(data.get("analysis") or "")
@@ -1014,6 +1018,8 @@ def normalize_hypotheses(data: Any, task_type: str, tried: list[str], max_n: int
             level = str(item.get(field_name) or "mid").lower().strip()
             level = _LEVEL_ALIASES.get(level, level)
             levels.append(level if level in _LEVELS else "mid")
+        if is_duplicate is not None and is_duplicate(title, kind):
+            continue
         seen.add(key)
         result.append(Hypothesis(title=title[:200], kind=kind, rationale=str(item.get("rationale") or "")[:400],
                                  expected_gain=levels[0], cost=levels[1], id=str(item.get("id") or "")))
@@ -1242,12 +1248,28 @@ class _Research:
             log.info("research: no usable plan: %s", P.clip(str(error), 300))
             data = None
         tried = self.memory.tried_titles() + [h.title for h in self.queue]
-        hypotheses, analysis = normalize_hypotheses(data, self.task_type, tried, cfg.hypotheses_per_plan)
+        hypotheses, analysis = normalize_hypotheses(data, self.task_type, tried, cfg.hypotheses_per_plan,
+                                                    is_duplicate=self._duplicate_check())
         if analysis:
             self.insights = P.clip(analysis, 500)
         self.queue.extend(hypotheses)
         log.info("research: plan → %d new hypotheses: %s", len(hypotheses),
                  "; ".join(f"[{h.kind}] {h.title}" for h in hypotheses))
+
+    def _duplicate_check(self) -> Callable[[str, str], bool]:
+        """Повтор по смыслу: уже проверенная гипотеза, гипотеза в очереди или выше в этом же плане."""
+        pending = [(h.title, h.kind) for h in self.queue]
+
+        def is_duplicate(title: str, kind: str) -> bool:
+            same = self.memory.find_similar(title, kind)
+            if same is not None or any(self.memory.same_idea(title, kind, t, k) for t, k in pending):
+                log.info("research: skip duplicate hypothesis [%s] %s%s", kind, title,
+                         f" (same idea as #{same.id})" if same is not None else "")
+                return True
+            pending.append((title, kind))
+            return False
+
+        return is_duplicate
 
     def _maybe_critic(self) -> None:
         """Перед re-plan: короткий разбор неудач, если их накопилось и токены позволяют."""
