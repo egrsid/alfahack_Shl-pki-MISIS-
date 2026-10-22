@@ -98,8 +98,8 @@ class AgentConfig:
     use_critic: bool = True
     no_think: bool = True               # дописывать /no_think (Qwen3: без длинного <think>)
     # размеры кусков промпта, символы
-    profile_chars: int = 6000
-    task_text_chars: int = 1500
+    profile_chars: int = 5000
+    task_text_chars: int = 1200
     memory_chars: int = 1500
     error_chars: int = 1500
     # файлы
