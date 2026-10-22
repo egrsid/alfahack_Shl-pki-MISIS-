@@ -1398,7 +1398,7 @@ class _Research:
             cv_std=float(cand.cv_std) if cand is not None else None,
             gain=decision.gain if decision is not None else None, code_hash=digest, error=error[:1000],
             duration_s=round(duration, 1), tokens_in=self.tokens_in - tokens_in,
-            tokens_out=self.tokens_out - tokens_out, columns=columns_in(changed, self.memory.columns),
+            tokens_out=self.tokens_out - tokens_out, columns=self._touched_columns(changed),
             diff=code_diff(base_code, last_code) if last_code else "", base_hash=code_hash(base_code)))
         self.durations.append(duration)
         self.consecutive_failures = self.consecutive_failures + 1 if status == "failed" else 0
@@ -1410,6 +1410,14 @@ class _Research:
             self.memory.dump_jsonl(self.workdir / "experiments.jsonl")
         except OSError:
             pass
+
+    def _touched_columns(self, changed: str) -> list[str]:
+        """Колонки, которых касается дифф: названные литералами и целые группы spec (spec.get("cat_cols"))."""
+        columns = columns_in(changed, self.memory.columns)
+        for group in ("cat_cols", "date_cols", "text_cols"):
+            if re.search(rf"""['"]{group}['"]""", changed):
+                columns += self.data.spec_dict.get(group, [])
+        return list(dict.fromkeys(columns))
 
     def _judge(self, cand: Candidate, decision: Decision, hypothesis: Hypothesis, n: int) -> tuple[str, str]:
         if not decision.accept:

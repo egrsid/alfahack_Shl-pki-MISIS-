@@ -183,6 +183,13 @@ def test_experiment_records_diff_columns_and_base(reg_task):
     assert rows[1]["columns"] == ["x3"] and "x1_x2" not in rows[1]["diff"]
 
 
+def test_columns_of_spec_groups_count_as_touched(reg_task):
+    code = feature_code('for col in spec.get("cat_cols", []):\n    df[col + "_n"] = df[col].map(df[col].value_counts())')
+    llm = MockLLM({"planner": [plan("Count encoding of categoricals", kind="encoding")], "coder": [fenced(code)]})
+    run_research(reg_task, llm)
+    assert experiments(reg_task)[0]["columns"] == ["city"]
+
+
 def test_rephrased_rejected_hypothesis_is_not_rerun(reg_task):
     llm = MockLLM({"planner": [plan("Count encoding of city", kind="encoding"),
                                plan("Frequency encoding for city", "Interaction x1*x2", kind="encoding")],
