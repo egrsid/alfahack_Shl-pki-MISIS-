@@ -964,6 +964,15 @@ def _call(fn: Callable, *args: Any, **kw: Any) -> Any:
     return fn(*args, **kw)
 
 
+def _plain_error(error: BaseException, limit: int = 200) -> str:
+    """Текст ошибки без HTML-страниц шлюза («504 Gateway Time-out» вместо всего nginx-ответа)."""
+    text = str(error)
+    if "<" in text and ">" in text:
+        title = re.search(r"<title>(.*?)</title>", text, re.S | re.I)
+        text = title.group(1) if title else re.sub(r"<[^>]+>", " ", text)
+    return " ".join(text.split())[:limit]
+
+
 def _is_budget_error(error: Exception) -> bool:
     text = str(error).lower()
     return "budget" in text and "exceed" in text
@@ -1456,7 +1465,7 @@ class _Research:
             raise
         except Exception as exc:  # ошибка харнесса на одном эксперименте не должна останавливать цикл
             log.exception("research: experiment %d crashed", n)
-            status, error = "failed", f"internal error: {type(exc).__name__}: {exc}"
+            status, error = "failed", f"internal error: {type(exc).__name__}: {_plain_error(exc, 300)}"
 
         duration = time.monotonic() - start
         changed = code_diff(base_code, last_code, max_lines=0) if last_code else ""

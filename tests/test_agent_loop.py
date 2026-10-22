@@ -282,6 +282,16 @@ def test_reasoning_hint_is_dropped_after_bad_request(reg_task):
     assert all("extra_body" not in kw for kw in kws[1:])
 
 
+def test_gateway_html_error_is_one_line_failure(reg_task):
+    page = "<html><head><title>504 Gateway Time-out</title></head><body><center>nginx/1.28.3</center></body></html>"
+    llm = MockLLM({"planner": [plan("Interaction x1*x2", "Scaled x3")],
+                   "coder": [RuntimeError(page), fenced(GOOD_CODE)]})
+    result, _, _ = run_research(reg_task, llm)
+    first = experiments(reg_task)[0]
+    assert first["status"] == "failed" and first["error"] == "internal error: RuntimeError: 504 Gateway Time-out"
+    assert len(result) == 1
+
+
 def test_budget_error_with_status_400_still_stops(reg_task):
     llm = MockLLM({"planner": [plan("Interaction x1*x2", "Scaled x3")],
                    "coder": [fenced(GOOD_CODE), BadRequest("Budget has been exceeded")]})
