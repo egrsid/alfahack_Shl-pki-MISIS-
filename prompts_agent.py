@@ -140,6 +140,9 @@ Hypothesis kinds:
 
 Rules:
 - One small concrete change per hypothesis; name the columns it uses.
+- Trees are invariant to monotonic transforms of one feature (log, sqrt, scaling, rank) and handle NaN \
+natively: such changes and plain median/mean imputation give zero gain. Prefer interactions, ratios, \
+differences, group statistics and counts across rows, which trees cannot build themselves.
 - The target is NOT available to feature code: no target encoding, no target statistics.
 - No external data; never use row order or row index as a feature.
 - Do not repeat what the memory says was already tried.

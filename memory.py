@@ -59,7 +59,7 @@ def _format(exp: Experiment) -> str:
     if exp.status == "failed":
         return f"{head} | error: {_one_line(exp.error, 140)}"
     gain = "" if exp.gain is None else f" (gain {exp.gain:+.4g})"
-    reason = f" | {_one_line(exp.error, 80)}" if exp.error else ""
+    reason = f" | {_one_line(exp.error, 160)}" if exp.error else ""
     return f"{head} | cv={_num(exp.cv_score)}{gain}{reason}"
 
 

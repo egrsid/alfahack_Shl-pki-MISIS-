@@ -161,6 +161,15 @@ def test_duplicate_code_is_not_rerun(reg_task):
     assert evaluator.calls == 3  # fallback из теста + эталон + первый эксперимент
 
 
+def test_ignored_params_are_reported_to_memory(reg_task):
+    code = GOOD_CODE.replace("PARAMS = {}", 'PARAMS = {"is_unbalance": True, "num_leaves": 15}')
+    llm = MockLLM({"planner": [plan("Interaction x1*x2")], "coder": [fenced(code)]})
+    result, _, _ = run_research(reg_task, llm)
+    row = experiments(reg_task)[0]
+    assert len(result) == 1 and result[0].meta["params"] == {"num_leaves": 15}
+    assert row["status"] == "accepted" and "is_unbalance" in row["error"] and "num_leaves" not in row["error"]
+
+
 # ---------------------------------------------------------------- рассуждающая модель (qwen3.8)
 
 class BadRequest(Exception):

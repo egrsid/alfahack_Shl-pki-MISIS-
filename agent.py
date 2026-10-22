@@ -1353,6 +1353,9 @@ class _Research:
             if cand is not None:
                 decision = decide(cand, self.current, self.greater, cfg)
                 status, error = self._judge(cand, decision, hypothesis, n)
+                ignored = [note for note in cand.meta.get("harness_notes", []) if note.startswith(CONSTANTS)]
+                if ignored:  # LLM должна узнать, что её MODEL/PARAMS не применились
+                    error = f"harness: {'; '.join(ignored)} | {error}"
         except LLMUnavailable:
             raise
         except Exception as exc:  # ошибка харнесса на одном эксперименте не должна останавливать цикл
