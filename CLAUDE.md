@@ -273,4 +273,6 @@ OPENAI_API_KEY=... OPENAI_BASE_URL=... python3 -c "..."   # скрипт tools/t
 ## Статус
 - Роли распределены (`924d19c`). Мы — P4, ветка `feature/agent-loop`, `main` ещё без `schemas.py`/`evaluator.py`/`llm_client.py`/`sandbox.py`, поэтому разработка идёт на моках по контрактам из раздела 2.
 - В репозитории: `solution.py` v0 (LightGBM без LLM, без CV), `check_llm.py` (smoke-тест LLM), `baseline.py` организаторов.
-- Следующий шаг: пункты 0–1 плана (план-файл в `docs/plans/` + каркас и моки).
+- Шаги 0–9 плана выполнены (подробности, результаты живого прогона и фрагмент вызова для P1 — в `docs/plans/feature-agent-loop.md`, раздел «Статус выполнения»).
+- Важно: `qwen/qwen3.8-27b` всегда рассуждает и тратит на это `max_tokens`; отключается `extra_body={"reasoning": {"enabled": false}}` — агент передаёт это через `**kw` клиента (P2 должен пробрасывать).
+- Следующий шаг: PR в `main` (шаг 10); после мержа соседей — заменить моки реальными `evaluator`/`llm_client`/`sandbox` в живом прогоне и откалибровать `ACCEPT_K`.
