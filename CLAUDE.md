@@ -169,4 +169,5 @@ LLM_DISABLED=1 .venv/bin/python -m pytest tests/ -q                     # все
 
 ## Статус
 - Ветка создана от `feature/experiment-memory` (`cb6cb70`); заглушка P1 — `stub/p1-tuning` (запушена, не мержить).
-- Следующий шаг: пункт 0 плана, затем `error_analysis.py`.
+- Шаги 0–6 выполнены (подробности и замеры — `docs/plans/feature-agent-strategies.md`, «Статус выполнения»).
+- Следующий шаг: PR по цепочке (`agent-loop` → `experiment-memory` → эта ветка) и замена `StubTuner` настоящим `tuning.tune` от P1.
