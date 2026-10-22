@@ -72,6 +72,8 @@ EvaluateFn = Callable[[Any, Callable, dict, Any], Candidate]
 RunCodeFn = Callable[[str, Path, float], Any]
 # guards.check_candidate(spec, cand, baseline) -> list[str], пусто = ок  (P5)
 GuardFn = Callable[[Any, Candidate, Candidate], list]
+# tuning.tune(spec, build_features, cfg, deadline) -> dict гиперпараметров  (P1; заглушка — ветка stub/p1-tuning)
+TuneFn = Callable[[Any, Callable, dict, Any], dict]
 
 
 @dataclass
@@ -120,6 +122,13 @@ class AgentConfig:
     memory_chars: int = 1500
     coder_memory_chars: int = 900       # кодеру: принятые шаги с диффом и 4 последних эксперимента
     errors_chars: int = 800             # сводка «где ошибается модель» для планировщика (0 — не считать)
+    # подбор гиперпараметров (вид гипотезы tune; нужен tuning.tune у P1)
+    tune_seconds: float = 900.0         # потолок на один подбор ...
+    tune_share: float = 0.3             # ... и не больше этой доли остатка окна research
+    tune_min_seconds: float = 30.0
+    tune_trials: int = 30
+    tune_seed: int = 42
+    auto_tune: bool = True              # плато/пустой план, а подбора не было → один раз подобрать перед остановкой
     error_chars: int = 1500
     # файлы
     workdir_name: str = ".agent_work"
@@ -127,11 +136,12 @@ class AgentConfig:
 
 
 def _optional(module: str, attr: str) -> Any:
-    """Функция модуля команды, если он уже смержен в main; иначе None."""
+    """Функция модуля команды, если он уже смержен в main; иначе None. Заглушки (STUB = True) не берём."""
     try:
-        return getattr(importlib.import_module(module), attr, None)
+        found = importlib.import_module(module)
     except ImportError:
         return None
+    return None if getattr(found, "STUB", False) else getattr(found, attr, None)
 
 
 # ============================================================ парсинг ответов LLM
@@ -352,6 +362,17 @@ def extract_constants(code: str) -> tuple[dict, list[str]]:
                 except (ValueError, SyntaxError, TypeError):
                     problems.append(f"{target.id} must be a literal value (no expressions or calls)")
     return found, problems
+
+
+def set_constant(code: str, name: str, value: Any) -> str:
+    """Код с заменённым (или дописанным) литералом верхнего уровня `name = value`."""
+    lines = code.rstrip("\n").split("\n")
+    for node in ast.parse(code).body:
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []
+        if any(isinstance(t, ast.Name) and t.id == name for t in targets):
+            lines[node.lineno - 1:node.end_lineno] = [f"{name} = {value!r}"]
+            return "\n".join(lines) + "\n"
+    return "\n".join(lines) + f"\n{name} = {value!r}\n"
 
 
 def normalize_model_config(consts: dict, task_type: str) -> tuple[str, dict, str | None, list[str]]:
@@ -983,17 +1004,21 @@ _KIND_ALIASES = {"feature": "features", "feature_engineering": "features", "inte
                  "imputation": "missing", "missing_values": "missing", "outlier": "outliers",
                  "clipping": "outliers", "target": "target_transform", "transform": "target_transform",
                  "log_target": "target_transform", "hyperparameters": "params", "hyperparams": "params",
-                 "tuning": "params", "param": "params", "models": "model", "algorithm": "model",
+                 "param": "params", "models": "model", "algorithm": "model", "tuning": "tune",
+                 "optuna": "tune", "hpo": "tune", "hyperparameter_search": "tune", "hyperparameter_tuning": "tune",
+                 "autotune": "tune",
                  "selection": "feature_selection", "drop": "feature_selection"}
 _LEVELS = {"low": 1, "mid": 2, "high": 3}
 _LEVEL_ALIASES = {"medium": "mid", "moderate": "mid", "med": "mid"}
 
 
 def normalize_hypotheses(data: Any, task_type: str, tried: list[str], max_n: int,
-                         is_duplicate: Callable[[str, str], bool] | None = None) -> tuple[list[Hypothesis], str]:
+                         is_duplicate: Callable[[str, str], bool] | None = None,
+                         can_tune: bool = False) -> tuple[list[Hypothesis], str]:
     """Ответ планировщика → гипотезы без повторов (с памятью и между собой), по убыванию выигрыш/стоимость.
 
     tried — точные повторы названий; is_duplicate(title, kind) — повторы по смыслу (перефразированные).
+    Без тюнера (can_tune=False) гипотеза tune становится params: параметры подберёт кодер.
     """
     analysis, items = "", data
     if isinstance(data, dict):
@@ -1013,7 +1038,9 @@ def normalize_hypotheses(data: Any, task_type: str, tried: list[str], max_n: int
         if not key or key in seen:
             continue
         kind = re.sub(r"[\s-]+", "_", str(item.get("kind") or item.get("type") or "features").lower().strip())
-        kind = kind if kind in P.KINDS else _KIND_ALIASES.get(kind, "features")
+        kind = kind if kind in P.KINDS or kind == P.TUNE_KIND else _KIND_ALIASES.get(kind, "features")
+        if kind == P.TUNE_KIND and not can_tune:
+            kind = "params"
         if kind == "target_transform" and task_type != "regression":
             continue
         levels = []
@@ -1035,9 +1062,10 @@ def normalize_hypotheses(data: Any, task_type: str, tried: list[str], max_n: int
 class _Research:
     def __init__(self, spec: Any, best: Candidate | None, llm: Any, deadline: Any, cfg: AgentConfig, *,
                  evaluate: EvaluateFn, run_code: RunCodeFn, profile: Callable | None, guards: GuardFn | None,
-                 data: TaskData | None) -> None:
+                 data: TaskData | None, tuner: TuneFn | None = None) -> None:
         self.spec, self.best, self.llm, self.deadline, self.cfg = spec, best, llm, deadline, cfg
         self.evaluate, self.run_code, self.profile_fn, self.guards, self.data = evaluate, run_code, profile, guards, data
+        self.tuner = tuner
         self.greater = bool(getattr(spec, "greater_is_better", False))
         self.memory = ExperimentMemory()
         self.accepted: list[Candidate] = []
@@ -1062,6 +1090,8 @@ class _Research:
                 return []
             while True:
                 self.stop_reason = self._stop_reason()
+                if self.stop_reason.startswith("plateau") and self._queue_auto_tune():
+                    self.stop_reason = ""
                 if self.stop_reason:
                     break
                 if not self.queue:
@@ -1069,7 +1099,7 @@ class _Research:
                     self._plan()
                     if not self.queue:
                         self.empty_plans += 1
-                        if self.empty_plans >= self.cfg.max_empty_plans:
+                        if self.empty_plans >= self.cfg.max_empty_plans and not self._queue_auto_tune():
                             self.stop_reason = "planner gives no new hypotheses"
                             break
                         continue
@@ -1081,6 +1111,18 @@ class _Research:
             raise
         finally:
             self._finish()
+
+    def _queue_auto_tune(self) -> bool:
+        """Перед остановкой (плато, пустой план): один подбор гиперпараметров, если его ещё не было."""
+        tried = any(e.kind == P.TUNE_KIND for e in self.memory.experiments) or any(
+            h.kind == P.TUNE_KIND for h in self.queue)
+        if not self.cfg.auto_tune or self.tuner is None or tried:
+            return False
+        model = normalize_model_config(extract_constants(self.base_code)[0], self.task_type)[0]
+        self.queue.appendleft(Hypothesis(title=f"Tune {model} hyperparameters (auto, before stopping)",
+                                         kind=P.TUNE_KIND, rationale="feature ideas stopped improving CV"))
+        log.info("research: no more gains from features — queued automatic hyperparameter tuning")
+        return True
 
     def result(self) -> list[Candidate]:
         """Принятые кандидаты по убыванию качества; при only_better_than_best — не хуже входного best."""
@@ -1247,7 +1289,8 @@ class _Research:
         messages = P.build_plan_messages(
             task_line=self.task_line, task_text=self.task_text, profile=self.profile_text, base_code=self.base_code,
             cv_text=self._cv_text(), n=cfg.hypotheses_per_plan, errors=self.errors_text,
-            memory=self.memory.planner_brief(cfg.memory_chars, kinds=P.KINDS, task_type=self.task_type),
+            can_tune=self.tuner is not None,
+            memory=self.memory.planner_brief(cfg.memory_chars, kinds=self._kinds(), task_type=self.task_type),
             task_chars=cfg.task_text_chars, profile_chars=cfg.profile_chars, memory_chars=cfg.memory_chars)
         kw = dict(max_tokens=cfg.plan_max_tokens, temperature=cfg.plan_temperature)
         data: Any = None
@@ -1268,12 +1311,16 @@ class _Research:
             data = None
         tried = self.memory.tried_titles() + [h.title for h in self.queue]
         hypotheses, analysis = normalize_hypotheses(data, self.task_type, tried, cfg.hypotheses_per_plan,
-                                                    is_duplicate=self._duplicate_check())
+                                                    is_duplicate=self._duplicate_check(),
+                                                    can_tune=self.tuner is not None)
         if analysis:
             self.insights = P.clip(analysis, 500)
         self.queue.extend(hypotheses)
         log.info("research: plan → %d new hypotheses: %s", len(hypotheses),
                  "; ".join(f"[{h.kind}] {h.title}" for h in hypotheses))
+
+    def _kinds(self) -> tuple[str, ...]:
+        return P.KINDS + ((P.TUNE_KIND,) if self.tuner is not None else ())
 
     def _duplicate_check(self) -> Callable[[str, str], bool]:
         """Повтор по смыслу: уже проверенная гипотеза, гипотеза в очереди или выше в этом же плане."""
@@ -1375,9 +1422,13 @@ class _Research:
         cand: Candidate | None = None
         decision: Decision | None = None
         try:
-            code = self._write_code(hypothesis)
-            error = "" if code else "answer has no ```python code block"
-            repairs = 0
+            if hypothesis.kind == P.TUNE_KIND:
+                code, error = self._tuned_code(n)
+                repairs = cfg.max_repairs  # чинить нечего: код писал не LLM
+            else:
+                code = self._write_code(hypothesis)
+                error = "" if code else "answer has no ```python code block"
+                repairs = 0
             while code is not None:
                 last_code = code
                 digest = code_hash(code)
@@ -1428,6 +1479,35 @@ class _Research:
         except OSError:
             pass
 
+    def _tuned_code(self, n: int) -> tuple[str | None, str]:
+        """Подбор гиперпараметров на признаках текущего лучшего кода; результат — тот же код с новым PARAMS."""
+        cfg = self.cfg
+        consts, problems = extract_constants(self.base_code)
+        if problems:
+            return None, "tuning: " + "; ".join(problems)
+        model, params, transform, _ = normalize_model_config(consts, self.task_type)
+        features = run_features(self.base_code, self.workdir / f"exp_{n:02d}_tune", self.inputs, self.data, cfg,
+                                self.run_code, timeout=min(cfg.features_timeout, max(1.0, self._left())))
+        if features.error:
+            return None, f"tuning: features of the current best failed: {P.clip(features.error, 500)}"
+        budget = min(cfg.tune_seconds, cfg.tune_share * self._left())
+        if budget < cfg.tune_min_seconds:
+            return None, f"tuning: only {budget:.0f}s available"
+        settings = {"model": model, "params": dict(params), "target_transform": transform,
+                    "n_trials": cfg.tune_trials, "seed": cfg.tune_seed}
+        start = time.monotonic()
+        try:
+            found = self.tuner(self.spec, make_build_features(features.x_train, features.x_test), settings,
+                               _SubDeadline(self.deadline, budget))
+        except Exception as error:
+            return None, f"tuning failed: {type(error).__name__}: {P.clip(str(error), 500)}"
+        if not isinstance(found, dict):
+            return None, f"tuning returned {type(found).__name__}, expected a dict of hyperparameters"
+        _, tuned, _, notes = normalize_model_config({"MODEL": model, "PARAMS": {**params, **found}}, self.task_type)
+        log.info("research: tuning %s in %.0fs → %s%s", model, time.monotonic() - start, tuned,
+                 f" ({'; '.join(notes)})" if notes else "")
+        return set_constant(self.base_code, "PARAMS", tuned), ""
+
     def _touched_columns(self, changed: str) -> list[str]:
         """Колонки, которых касается дифф: названные литералами и целые группы spec (spec.get("cat_cols"))."""
         columns = columns_in(changed, self.memory.columns)
@@ -1471,7 +1551,8 @@ def research(spec: Any, best: Candidate | None, llm: LLMClient | None, deadline:
              run_code: RunCodeFn | None = None,
              profile: Callable | None = None,
              guards: GuardFn | None = None,
-             data: Any = None) -> list[Candidate]:
+             data: Any = None,
+             tuner: TuneFn | None = None) -> list[Candidate]:
     """Принятые кандидаты по убыванию качества CV (первый — лучший) или [].
 
     Необязательные аргументы — для тестов и для P1: подменить evaluator/песочницу/профиль
@@ -1498,7 +1579,8 @@ def research(spec: Any, best: Candidate | None, llm: LLMClient | None, deadline:
         loop = _Research(spec, best, llm, deadline, cfg, evaluate=evaluate,
                          run_code=run_code or _optional("sandbox", "run_code") or _local_run_code,
                          profile=profile or _optional("eda", "profile"),
-                         guards=guards or _optional("guards", "check_candidate"), data=data)
+                         guards=guards or _optional("guards", "check_candidate"), data=data,
+                         tuner=tuner or _optional("tuning", "tune"))
         return loop.run()
     except LLMUnavailable as error:
         log.warning("research: LLM недоступна (%s) — возвращаем накопленное", P.clip(str(error), 300))

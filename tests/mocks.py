@@ -2,6 +2,7 @@
 
 MockLLM       — вместо llm_client (P2): ответы по сценарию для каждой роли промпта.
 StubEvaluator — вместо evaluator.evaluate (P1): K-fold на фиксированном сиде, LightGBM по умолчанию.
+StubTuner     — вместо tuning.tune (P1): заданный ответ или маленький перебор сетки тем же evaluator.
 SimpleDeadline — вместо budget.Deadline (P1).
 SpecStub      — поля TaskSpec из schemas.py (P1), пока его нет в main.
 """
@@ -235,6 +236,41 @@ class StubEvaluator:
                          meta={"fold_scores": fold_scores, "model": name, "params": model_params,
                                "target_transform": "log1p" if log_target else None,
                                "n_splits": self.n_splits, "seed": self.seed})
+
+
+class StubTuner:
+    """Заглушка tuning.tune(spec, build_features, cfg, deadline) -> dict (P1).
+
+    result — что вернуть (dict) или исключение (бросается). С evaluator и grid — маленький перебор:
+    каждый набор из grid поверх cfg["params"] оценивается тем же evaluator, возвращается лучший
+    (для dry-run и живых прогонов, пока у P1 нет настоящего подбора на Optuna).
+    """
+
+    def __init__(self, result: Any = None, *, evaluator: Any = None, grid: list[dict] | tuple = (),
+                 greater_is_better: bool = False) -> None:
+        self.result, self.evaluator, self.grid, self.greater = result, evaluator, list(grid), greater_is_better
+        self.calls: list[tuple[dict, float | None]] = []
+
+    def __call__(self, spec: Any, build_features: Any, cfg: dict, deadline: Any = None) -> dict:
+        self.calls.append((cfg, deadline.left() if deadline is not None else None))
+        if isinstance(self.result, BaseException):
+            raise self.result
+        if self.evaluator is None:
+            return dict(self.result or {})
+        best, best_score = dict(cfg.get("params") or {}), None
+        for params in self.grid:
+            if deadline is not None and deadline.left() < 5:
+                break
+            trial = {**(cfg.get("params") or {}), **params}
+            score = self.evaluator(spec, build_features, {**cfg, "params": trial}, deadline).cv_score
+            if best_score is None or (score > best_score if self.greater else score < best_score):
+                best, best_score = trial, score
+        return best
+
+
+LIGHTGBM_GRID = [{"n_estimators": 600, "learning_rate": 0.05, "num_leaves": 63},
+                 {"n_estimators": 800, "learning_rate": 0.03, "num_leaves": 31, "min_child_samples": 50},
+                 {"n_estimators": 400, "learning_rate": 0.08, "num_leaves": 127, "colsample_bytree": 0.7}]
 
 
 def identity_features(train: pd.DataFrame, test: pd.DataFrame, spec: Any) -> tuple[pd.DataFrame, pd.DataFrame]:
