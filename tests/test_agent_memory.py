@@ -2,7 +2,8 @@ import json
 
 import pytest
 
-from memory import Experiment, ExperimentMemory, code_diff, code_hash, columns_in, normalize_title
+from memory import (Experiment, ExperimentMemory, code_diff, code_hash, columns_in, mentioned_columns,
+                    normalize_title, same_idea)
 
 
 def exp(memory, title, status="rejected", **kw):
@@ -108,3 +109,64 @@ spec.get("cat_cols"); df["it's"]"""
     known = ["floor_area", "year_built", "id", "facility_type", "it's"]
     assert columns_in(code, known) == ["floor_area", "year_built", "id", "it's"]
     assert columns_in("", known) == [] and columns_in(code, []) == []
+
+
+COLUMNS = ["floor_area", "year_built", "Year_Factor", "State_Factor", "facility_type", "energy_star_rating",
+           "sbytes", "dbytes", "proto", "city", "x1", "x2", "x3"]
+
+# (kind, title_a, title_b, дубль?) — в т.ч. реальные названия из живых прогонов Qwen
+SAME_IDEA = [
+    ("encoding", "Frequency encoding of facility_type", "Count encoding facility_type", True),
+    ("encoding", "Frequency encoding for high-cardinality categoricals",
+     "Count encoding of high cardinality categorical columns", True),
+    ("features", "Log1p transform floor_area", "Apply log to floor_area", True),
+    ("features", "Ratio sbytes / dbytes", "sbytes divided by dbytes", True),
+    ("features", "Group mean of floor_area by facility_type", "Mean floor_area per facility_type", True),
+    ("missing", "Missing indicator for year_built", "NaN flag year_built", True),
+    ("missing", "Impute year_built with median", "Fill missing year_built with median", True),
+    ("params", "Increase lightgbm num_leaves", "Raise num_leaves of LightGBM", True),
+    ("model", "Switch to CatBoost", "Use CatBoost model", True),
+    ("target_transform", "Log1p target transformation", "Log transform of the target", True),
+    ("feature_selection", "Drop redundant monthly temp cols", "Remove redundant monthly temperature columns", True),
+    ("outliers", "Clip outliers of floor_area", "Winsorize floor_area at 1%", True),
+    ("features", "Interaction x1*x2", "interaction: x1 * x2", True),
+    ("features", "Ratio sbytes / dbytes", "Difference sbytes - dbytes", False),
+    ("encoding", "Frequency encoding of facility_type", "Frequency encoding of State_Factor", False),
+    ("features", "Log1p transform floor_area", "Log1p transform energy_star_rating", False),
+    ("params", "Increase num_leaves", "Decrease num_leaves", False),
+    ("params", "Raise learning_rate of lightgbm to 0.1", "Lower lightgbm learning_rate", False),
+    ("params", "Increase learning rate", "Increase n_estimators", False),
+    ("features", "Age of building (Year_Factor - year_built)", "Building floor area per year", False),
+    ("features", "Create protocol-specific interaction features", "Add asymmetry and ratio features", False),
+    ("encoding", "Count encoding of city", "Rare category grouping of city", False),
+    ("features", "Interaction x1*x2", "Same interaction again", False),
+    ("features", "Interaction x1*x2", "Interaction x1*x3", False),
+    ("missing", "Missing indicator for year_built", "Missing indicator for energy_star_rating", False),
+    ("features", "Ratio of heating to cooling degree days", "Frequency encoding of facility_type", False),
+]
+
+
+@pytest.mark.parametrize("kind, a, b, expected", SAME_IDEA)
+def test_same_idea_table(kind, a, b, expected):
+    assert same_idea(a, kind, b, kind, COLUMNS) is expected
+    assert same_idea(b, kind, a, kind, COLUMNS) is expected  # симметрично
+
+
+def test_same_idea_needs_same_kind():
+    assert not same_idea("Frequency encoding of city", "encoding", "Frequency of city", "features", COLUMNS)
+
+
+def test_mentioned_columns_whole_words_and_spaces():
+    assert mentioned_columns("log of Floor Area and year_built_x", COLUMNS) == {"floor_area"}
+    assert mentioned_columns("x1*x2 vs x10", COLUMNS) == {"x1", "x2"}
+
+
+def test_find_similar_rejected_blocks_failed_allows_one_retry():
+    memory = ExperimentMemory(columns=COLUMNS)
+    exp(memory, "Frequency encoding of facility_type", "rejected", kind="encoding")
+    exp(memory, "Ratio sbytes / dbytes", "failed", error="KeyError")
+    assert memory.find_similar("Count encoding facility_type", "encoding").id == 1
+    assert memory.find_similar("Count encoding facility_type", "features") is None
+    assert memory.find_similar("sbytes divided by dbytes", "features") is None  # одно падение — можно повторить
+    exp(memory, "sbytes / dbytes ratio", "failed", error="KeyError")
+    assert memory.find_similar("sbytes divided by dbytes", "features").id == 3

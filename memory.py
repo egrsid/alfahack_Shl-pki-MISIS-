@@ -43,6 +43,104 @@ def code_diff(old: str, new: str, max_lines: int = 15) -> str:
     return "\n".join(changed)
 
 
+# ---------------------------------------------------------------- похожие гипотезы
+
+_STOPWORDS = {
+    "a", "an", "the", "of", "for", "to", "and", "with", "on", "in", "by", "from", "as", "into", "at", "per", "via",
+    "add", "adding", "added", "create", "creating", "new", "use", "using", "apply", "applying", "compute",
+    "computing", "make", "build", "try", "switch", "feature", "features", "column", "columns", "col", "cols",
+    "variable", "variables", "value", "values", "based", "all", "each", "simple", "basic", "extra", "additional",
+    "existing", "raw", "transform", "transformation", "transformed", "model", "outlier", "outliers", "extreme",
+}
+_SYNONYMS = {
+    "frequency": "count", "freq": "count",
+    "ratio": "div", "divide": "div", "divided": "div", "division": "div", "proportion": "div", "share": "div",
+    "fraction": "div",
+    "interaction": "product", "multiply": "product", "multiplication": "product", "cross": "product",
+    "times": "product",
+    "log1p": "log", "logarithm": "log", "logarithmic": "log", "ln": "log",
+    "root": "sqrt",
+    "nan": "missing", "null": "missing", "na": "missing", "missingness": "missing", "isnull": "missing",
+    "isna": "missing",
+    "imputation": "impute", "imputing": "impute", "fill": "impute", "fillna": "impute", "filling": "impute",
+    "encode": "encoding", "encoded": "encoding", "encoder": "encoding",
+    "aggregate": "agg", "aggregation": "agg", "groupby": "agg", "group": "agg", "grouped": "agg", "grouping": "agg",
+    "difference": "diff", "subtract": "diff", "subtraction": "diff", "minus": "diff", "delta": "diff",
+    "total": "sum", "average": "mean", "avg": "mean",
+    "clipping": "clip", "winsorize": "clip", "winsorizing": "clip", "winsorization": "clip", "cap": "clip",
+    "capping": "clip", "truncate": "clip",
+    "remove": "drop", "removing": "drop", "dropping": "drop", "exclude": "drop", "delete": "drop",
+    "indicator": "flag", "binary": "flag", "dummy": "flag",
+    "infrequent": "rare", "temperature": "temp",
+    "lgbm": "lightgbm", "lgb": "lightgbm", "xgb": "xgboost", "cb": "catboost",
+    "raise": "increase", "higher": "increase", "larger": "increase", "more": "increase",
+    "lower": "decrease", "reduce": "decrease", "smaller": "decrease", "less": "decrease",
+    "tuning": "tune", "optimize": "tune",
+}
+
+
+_OPPOSITES = (("increase", "decrease"),)
+
+
+def _canonical(word: str) -> str:
+    word = _SYNONYMS.get(word, word)
+    if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+        word = _SYNONYMS.get(word[:-1], word[:-1])
+    return word
+
+
+def title_tokens(title: str) -> set[str]:
+    """Смысловые слова названия: без стоп-слов, синонимы и формы приведены к одному слову."""
+    words = (_canonical(w) for w in normalize_title(title).split())
+    return {w for w in words if w and w not in _STOPWORDS}
+
+
+def mentioned_columns(text: str, known: Iterable[str]) -> set[str]:
+    """Известные колонки, названные в тексте целым словом (floor_area или «floor area»)."""
+    text = (text or "").lower()
+    found = set()
+    for name in known:
+        for variant in {name.lower(), name.lower().replace("_", " ")}:
+            if variant and re.search(rf"(?<!\w){re.escape(variant)}(?!\w)", text):
+                found.add(name)
+                break
+    return found
+
+
+def _overlap(a: set[str], b: set[str]) -> float:
+    """Среднее Жаккара и коэффициента перекрытия: «то же + уточнение» тоже похоже."""
+    if not a or not b:
+        return 0.0
+    common = len(a & b)
+    return (common / len(a | b) + common / min(len(a), len(b))) / 2
+
+
+def similar_titles(a: str, b: str) -> float:
+    return _overlap(title_tokens(a), title_tokens(b))
+
+
+def same_idea(title_a: str, kind_a: str, title_b: str, kind_b: str, columns: Iterable[str] = (),
+              threshold: float = 0.6) -> bool:
+    """Одна и та же гипотеза другими словами: тот же kind и (при названных колонках — те же колонки)
+    похожие действия над ними."""
+    if kind_a != kind_b:
+        return False
+    if normalize_title(title_a) == normalize_title(title_b):
+        return True
+    tokens_a, tokens_b = title_tokens(title_a), title_tokens(title_b)
+    if any((x in tokens_a and y in tokens_b) or (y in tokens_a and x in tokens_b) for x, y in _OPPOSITES):
+        return False  # «увеличить» и «уменьшить» одно и то же — разные гипотезы
+    columns = list(columns)
+    cols_a, cols_b = mentioned_columns(title_a, columns), mentioned_columns(title_b, columns)
+    if cols_a and cols_b:
+        if cols_a != cols_b:
+            return False
+        names = title_tokens(" ".join(cols_a))
+        ops_a, ops_b = tokens_a - names, tokens_b - names
+        return (not ops_a and not ops_b) or _overlap(ops_a, ops_b) >= threshold
+    return _overlap(tokens_a, tokens_b) >= threshold
+
+
 _STRING_LITERAL = re.compile(r"""(['"])((?:\\.|(?!\1).)*)\1""")
 
 
@@ -127,6 +225,19 @@ class ExperimentMemory:
 
     def find_code(self, digest: str) -> Experiment | None:
         return next((exp for exp in self.experiments if exp.code_hash == digest), None)
+
+    def same_idea(self, title_a: str, kind_a: str, title_b: str, kind_b: str, threshold: float = 0.6) -> bool:
+        return same_idea(title_a, kind_a, title_b, kind_b, self.columns, threshold)
+
+    def find_similar(self, title: str, kind: str, threshold: float = 0.6) -> Experiment | None:
+        """Уже проверенная гипотеза с той же идеей. Упавшую можно повторить один раз
+        (могла упасть из-за кода, а не идеи): дублем она считается со второго падения."""
+        matches = [e for e in self.experiments if self.same_idea(title, kind, e.hypothesis, e.kind, threshold)]
+        decided = [e for e in matches if e.status != "failed"]
+        if decided:
+            return decided[-1]
+        failed = [e for e in matches if e.status == "failed"]
+        return failed[-1] if len(failed) >= 2 else None
 
     def summary(self, max_chars: int = 1500, recent: int = 8) -> str:
         """Сводка для промпта: последние эксперименты подробно, старые — одной строкой, заметки критика."""
