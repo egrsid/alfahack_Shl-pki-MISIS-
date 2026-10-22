@@ -133,7 +133,8 @@ Hypothesis kinds:
 - encoding: categorical handling (frequency/count encoding, grouping rare levels, combining columns)
 - missing: missing-value indicators or imputation
 - outliers: clipping or winsorizing extreme feature values
-- target_transform: log1p of the target (regression with a non-negative skewed target only)
+- target_transform: log1p of the target (regression with a non-negative skewed target only); it optimizes \
+relative error, so it suits RMSLE/MAPE-like metrics and often hurts RMSE/MAE on the raw scale
 - params: gradient boosting hyperparameters
 - model: switch between lightgbm, catboost and xgboost
 - feature_selection: drop noisy, constant, duplicated or ID-like columns
