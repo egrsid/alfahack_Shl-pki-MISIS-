@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import importlib
+import inspect
 import json
 import logging
 import math
@@ -22,12 +23,16 @@ import signal
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from collections import deque
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
 import numpy as np
 import pandas as pd
+
+import prompts_agent as P
+from memory import Experiment, ExperimentMemory, code_hash, normalize_title
 
 log = logging.getLogger("agent")
 
@@ -862,6 +867,510 @@ def decide(new: Candidate, current: Candidate, greater_is_better: bool, cfg: Age
     return Decision(accept, gain, threshold, noise, suspicious, reason)
 
 
+# ============================================================ время, токены, вызовы LLM
+
+def _time_left(deadline: Any) -> float:
+    """Секунды до конца окна research: deadline.stage("research"), иначе deadline.left()."""
+    if deadline is None:
+        return math.inf
+    stage = getattr(deadline, "stage", None)
+    if callable(stage):
+        try:
+            value = stage("research")
+            return float(value.left() if hasattr(value, "left") else value)
+        except Exception:
+            pass
+    left = getattr(deadline, "left", None)
+    try:
+        return float(left()) if callable(left) else math.inf
+    except Exception:
+        return math.inf
+
+
+class _SubDeadline:
+    """Дедлайн одного вызова evaluate: min(лимит на кандидата, остаток окна research)."""
+
+    def __init__(self, parent: Any, seconds: float) -> None:
+        self._parent, self._end = parent, time.monotonic() + seconds
+
+    def left(self) -> float:
+        return max(0.0, min(self._end - time.monotonic(), _time_left(self._parent)))
+
+    def stage(self, name: str) -> float:
+        return self.left()
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._parent, name)
+
+
+def _read_usage(llm: Any) -> tuple[int, int] | None:
+    """Счётчик токенов клиента (P2), если он его отдаёт: словарь usage, объект usage или атрибуты."""
+    usage = getattr(llm, "usage", None)
+    if callable(usage):
+        try:
+            usage = usage()
+        except Exception:
+            usage = None
+    if isinstance(usage, dict):
+        tokens_in = next((usage[k] for k in ("prompt_tokens", "tokens_in", "input_tokens") if k in usage), None)
+        tokens_out = next((usage[k] for k in ("completion_tokens", "tokens_out", "output_tokens") if k in usage), 0)
+        if tokens_in is not None:
+            return int(tokens_in), int(tokens_out or 0)
+    for source in (usage, llm):
+        for a, b in (("prompt_tokens", "completion_tokens"), ("tokens_in", "tokens_out")):
+            if source is not None and isinstance(getattr(source, a, None), (int, float)):
+                return int(getattr(source, a)), int(getattr(source, b, 0) or 0)
+    return None
+
+
+def _call(fn: Callable, *args: Any, **kw: Any) -> Any:
+    """Вызов метода клиента только с теми именованными аргументами, которые он принимает."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return fn(*args, **kw)
+    if not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        kw = {k: v for k, v in kw.items() if k in params}
+    return fn(*args, **kw)
+
+
+def _is_budget_error(error: Exception) -> bool:
+    text = str(error).lower()
+    return "budget" in text and "exceed" in text
+
+
+def _no_think(messages: list[dict]) -> list[dict]:
+    """Qwen3: «/no_think» в последнем сообщении пользователя отключает длинный <think>."""
+    messages = [dict(m) for m in messages]
+    for message in reversed(messages):
+        if message["role"] == "user":
+            message["content"] = message["content"].rstrip() + "\n/no_think"
+            break
+    return messages
+
+
+# ============================================================ гипотезы
+
+@dataclass
+class Hypothesis:
+    title: str
+    kind: str = "features"
+    rationale: str = ""
+    expected_gain: str = "mid"
+    cost: str = "mid"
+    id: str = ""
+
+
+_KIND_ALIASES = {"feature": "features", "feature_engineering": "features", "interaction": "features",
+                 "aggregation": "features", "categorical": "encoding", "encode": "encoding",
+                 "imputation": "missing", "missing_values": "missing", "outlier": "outliers",
+                 "clipping": "outliers", "target": "target_transform", "transform": "target_transform",
+                 "log_target": "target_transform", "hyperparameters": "params", "hyperparams": "params",
+                 "tuning": "params", "param": "params", "models": "model", "algorithm": "model",
+                 "selection": "feature_selection", "drop": "feature_selection"}
+_LEVELS = {"low": 1, "mid": 2, "high": 3}
+_LEVEL_ALIASES = {"medium": "mid", "moderate": "mid", "med": "mid"}
+
+
+def normalize_hypotheses(data: Any, task_type: str, tried: list[str], max_n: int) -> tuple[list[Hypothesis], str]:
+    """Ответ планировщика → гипотезы без повторов (с памятью и между собой), по убыванию выигрыш/стоимость."""
+    analysis, items = "", data
+    if isinstance(data, dict):
+        analysis = str(data.get("analysis") or "")
+        items = next((data[k] for k in ("hypotheses", "experiments", "ideas", "items")
+                      if isinstance(data.get(k), list)), [])
+    seen = {normalize_title(t) for t in tried}
+    result = []
+    for item in items if isinstance(items, list) else []:
+        if isinstance(item, str):
+            item = {"title": item}
+        if not isinstance(item, dict):
+            continue
+        title = " ".join(str(item.get("title") or item.get("name") or item.get("hypothesis")
+                             or item.get("description") or "").split())
+        key = normalize_title(title)
+        if not key or key in seen:
+            continue
+        kind = re.sub(r"[\s-]+", "_", str(item.get("kind") or item.get("type") or "features").lower().strip())
+        kind = kind if kind in P.KINDS else _KIND_ALIASES.get(kind, "features")
+        if kind == "target_transform" and task_type != "regression":
+            continue
+        levels = []
+        for field_name in ("expected_gain", "cost"):
+            level = str(item.get(field_name) or "mid").lower().strip()
+            level = _LEVEL_ALIASES.get(level, level)
+            levels.append(level if level in _LEVELS else "mid")
+        seen.add(key)
+        result.append(Hypothesis(title=title[:200], kind=kind, rationale=str(item.get("rationale") or "")[:400],
+                                 expected_gain=levels[0], cost=levels[1], id=str(item.get("id") or "")))
+    result.sort(key=lambda h: -_LEVELS[h.expected_gain] / _LEVELS[h.cost])
+    return result[:max_n], analysis
+
+
+# ============================================================ цикл исследования
+
+class _Research:
+    def __init__(self, spec: Any, best: Candidate | None, llm: Any, deadline: Any, cfg: AgentConfig, *,
+                 evaluate: EvaluateFn, run_code: RunCodeFn, profile: Callable | None, guards: GuardFn | None,
+                 data: TaskData | None) -> None:
+        self.spec, self.best, self.llm, self.deadline, self.cfg = spec, best, llm, deadline, cfg
+        self.evaluate, self.run_code, self.profile_fn, self.guards, self.data = evaluate, run_code, profile, guards, data
+        self.greater = bool(getattr(spec, "greater_is_better", False))
+        self.memory = ExperimentMemory()
+        self.accepted: list[Candidate] = []
+        self.queue: deque[Hypothesis] = deque()
+        self.current: Candidate | None = None
+        self.base_code = BASE_CODE
+        self.insights = ""
+        self.tokens_in = self.tokens_out = self.llm_calls = 0
+        self.iteration = self.consecutive_failures = self.no_improve = self.empty_plans = self.since_critic = 0
+        self.durations: list[float] = []
+        self.reference_seconds = 60.0
+        self.stop_reason = ""
+        self.workdir = Path(spec.task_dir) / cfg.workdir_name
+
+    # ---------------------------------------------------------------- главный цикл
+    def run(self) -> list[Candidate]:
+        try:
+            self._prepare()
+            if not self._init_reference():
+                return []
+            while True:
+                self.stop_reason = self._stop_reason()
+                if self.stop_reason:
+                    break
+                if not self.queue:
+                    self._maybe_critic()
+                    self._plan()
+                    if not self.queue:
+                        self.empty_plans += 1
+                        if self.empty_plans >= self.cfg.max_empty_plans:
+                            self.stop_reason = "planner gives no new hypotheses"
+                            break
+                        continue
+                    self.empty_plans = 0
+                self._iterate(self.queue.popleft())
+            return self.result()
+        except LLMUnavailable:
+            self.stop_reason = "LLM unavailable"
+            raise
+        finally:
+            self._finish()
+
+    def result(self) -> list[Candidate]:
+        """Принятые кандидаты по убыванию качества; при only_better_than_best — не хуже входного best."""
+        cands = [c for c in self.accepted if math.isfinite(float(c.cv_score))]
+        if self.cfg.only_better_than_best and self.best is not None and math.isfinite(float(self.best.cv_score)):
+            sign = 1.0 if self.greater else -1.0
+            cands = [c for c in cands if sign * (float(c.cv_score) - float(self.best.cv_score)) >= 0]
+        return sorted(cands, key=lambda c: float(c.cv_score), reverse=self.greater)
+
+    def _prepare(self) -> None:
+        cfg = self.cfg
+        self.data = self.data or load_task_data(self.spec)
+        self.task_type = self.data.spec_dict["task_type"]
+        self.inputs = write_inputs(self.data, self.workdir)
+
+        mini = _mini_profile(self.data)
+        profile: Any = None
+        if self.profile_fn is not None:
+            try:
+                target = self.data.spec_dict["target"]
+                train = (self.data.train_x.assign(**{target: self.data.y})
+                         if isinstance(self.data.y, pd.Series) and isinstance(target, str) else self.data.train_x)
+                profile = self.profile_fn(train, self.data.test_x, self.spec)
+            except Exception as error:
+                log.warning("research: eda.profile failed (%s), using the mini profile", error)
+        if isinstance(profile, str) and profile.strip():
+            self.profile_text = P.clip(profile, cfg.profile_chars)
+        else:
+            self.profile_text = P.render_profile(profile or mini, self.data.spec_dict["feature_notes"],
+                                                 cfg.profile_chars)
+        self.columns_text = P.render_columns_brief(mini)
+        direction = "higher is better" if self.greater else "lower is better"
+        self.task_line = (f"type: {self.task_type} | metric: {self.data.spec_dict['metric']} ({direction}) | "
+                          f"target: {self.data.spec_dict['target']} | rows: train {len(self.data.train_x)}, "
+                          f"test {len(self.data.test_x)}")
+        self.task_text = str(getattr(self.spec, "raw_task_text", "") or "")
+
+    def _init_reference(self) -> bool:
+        """Точка отсчёта: код best (если это кандидат агента) или BASE_CODE, оценённый тем же evaluator."""
+        meta = (getattr(self.best, "meta", None) or {}) if self.best is not None else {}
+        if meta.get("code") and math.isfinite(float(self.best.cv_score)):
+            self.base_code, self.current = meta["code"], self.best
+            self.reference_seconds = float(meta.get("seconds", self.reference_seconds))
+            return True
+        start = time.monotonic()
+        cand, error = self._evaluate_code(BASE_CODE, "exp_00_base")
+        self.reference_seconds = time.monotonic() - start
+        if cand is None:
+            log.warning("research: base features failed, stopping: %s", P.clip(error, 500))
+            return False
+        self.base_code, self.current = BASE_CODE, cand
+        best_cv = f"{float(self.best.cv_score):.5g}" if self.best is not None else "n/a"
+        log.info("research: reference %s=%.5g (input best %s), %.0fs", self.data.spec_dict["metric"],
+                 cand.cv_score, best_cv, self.reference_seconds)
+        return True
+
+    def _finish(self) -> None:
+        log.info("research: stop (%s); experiments %d, accepted %d, LLM calls %d, tokens in/out %d/%d",
+                 self.stop_reason or "error", len(self.memory.experiments), len(self.accepted), self.llm_calls,
+                 self.tokens_in, self.tokens_out)
+        try:
+            self.memory.dump_jsonl(self.workdir / "experiments.jsonl")
+            if not self.cfg.keep_artifacts:
+                for path in (self.workdir / "input").glob("*.parquet"):
+                    path.unlink(missing_ok=True)
+        except OSError as error:
+            log.warning("research: cannot write artifacts: %s", error)
+
+    # ---------------------------------------------------------------- бюджеты
+    def _left(self) -> float:
+        return _time_left(self.deadline)
+
+    def tokens_used(self) -> int:
+        return self.tokens_in + self.tokens_out
+
+    def _expected_seconds(self) -> float:
+        """Сколько займёт ещё одна итерация: типичная длительность (не меньше эталонной оценки) + LLM."""
+        recent = self.durations[-5:]
+        typical = max(float(np.median(recent)) if recent else 0.0, self.reference_seconds)
+        return typical * 1.25 + self.cfg.llm_reserve_seconds
+
+    def _stop_reason(self) -> str:
+        cfg = self.cfg
+        if self.iteration >= cfg.max_iters:
+            return f"max_iters={cfg.max_iters}"
+        left, need = self._left(), self._expected_seconds()
+        if left < need:
+            return f"time: {left:.0f}s left, an iteration needs ~{need:.0f}s"
+        if self.tokens_used() >= cfg.max_tokens:
+            return f"tokens: {self.tokens_used()} >= {cfg.max_tokens}"
+        if self.consecutive_failures >= cfg.max_consecutive_failures:
+            return f"{self.consecutive_failures} failures in a row"
+        if self.no_improve >= cfg.max_no_improve:
+            return f"plateau: {self.no_improve} experiments without improvement"
+        return ""
+
+    # ---------------------------------------------------------------- LLM
+    def _llm(self, method: str, messages: list[dict], *args: Any, **kw: Any) -> Any:
+        if self.cfg.no_think:
+            messages = _no_think(messages)
+        before, result = _read_usage(self.llm), None
+        try:
+            result = _call(getattr(self.llm, method), messages, *args, **kw)
+            return result
+        except LLMUnavailable:
+            raise
+        except Exception as error:
+            if _is_budget_error(error):
+                raise LLMUnavailable(str(error)) from error
+            raise
+        finally:
+            after = _read_usage(self.llm)
+            if before is not None and after is not None:
+                spent_in, spent_out = after[0] - before[0], after[1] - before[1]
+            else:  # клиент не отдаёт счётчик — грубая оценка по длине
+                answer = result if isinstance(result, str) else json.dumps(result, default=str) if result else ""
+                spent_in, spent_out = P.messages_tokens(messages), P.estimate_tokens(answer)
+            self.tokens_in += spent_in
+            self.tokens_out += spent_out
+            self.llm_calls += 1
+
+    def _cv_text(self) -> str:
+        return f"CV {self.data.spec_dict['metric']} = {float(self.current.cv_score):.5g}"
+
+    def _plan(self) -> None:
+        cfg = self.cfg
+        messages = P.build_plan_messages(
+            task_line=self.task_line, task_text=self.task_text, profile=self.profile_text, base_code=self.base_code,
+            cv_text=self._cv_text(), memory=self.memory.summary(cfg.memory_chars), n=cfg.hypotheses_per_plan,
+            task_chars=cfg.task_text_chars, profile_chars=cfg.profile_chars, memory_chars=cfg.memory_chars)
+        kw = dict(max_tokens=cfg.plan_max_tokens, temperature=cfg.plan_temperature)
+        data: Any = None
+        try:
+            if callable(getattr(self.llm, "chat_json", None)):
+                try:
+                    data = self._llm("chat_json", messages, P.PLAN_SCHEMA, **kw)
+                except LLMUnavailable:
+                    raise
+                except Exception as error:  # клиент не справился с JSON — разбираем сами
+                    log.info("research: planner chat_json failed (%s), parsing plain chat", error)
+            if not _is_payload(data):
+                data = extract_json(self._llm("chat", messages, **kw))
+        except LLMUnavailable:
+            raise
+        except Exception as error:
+            log.info("research: no usable plan: %s", P.clip(str(error), 300))
+            data = None
+        tried = self.memory.tried_titles() + [h.title for h in self.queue]
+        hypotheses, analysis = normalize_hypotheses(data, self.task_type, tried, cfg.hypotheses_per_plan)
+        if analysis:
+            self.insights = P.clip(analysis, 500)
+        self.queue.extend(hypotheses)
+        log.info("research: plan → %d new hypotheses: %s", len(hypotheses),
+                 "; ".join(f"[{h.kind}] {h.title}" for h in hypotheses))
+
+    def _maybe_critic(self) -> None:
+        """Перед re-plan: короткий разбор неудач, если их накопилось и токены позволяют."""
+        cfg = self.cfg
+        if not cfg.use_critic or self.since_critic < 2 or self.tokens_used() > 0.7 * cfg.max_tokens:
+            return
+        self.since_critic = 0
+        messages = P.build_critic_messages(task_line=self.task_line, memory=self.memory.summary(cfg.memory_chars))
+        try:
+            note = strip_think(self._llm("chat", messages, max_tokens=cfg.critic_max_tokens, temperature=0.3))
+        except LLMUnavailable:
+            raise
+        except Exception as error:
+            log.info("research: critic failed: %s", error)
+            return
+        if note:
+            self.memory.add_note(P.clip(note, 800))
+
+    def _write_code(self, hypothesis: Hypothesis) -> str | None:
+        cfg = self.cfg
+        messages = P.build_code_messages(
+            task_line=self.task_line, columns=self.columns_text, insights=self.insights, base_code=self.base_code,
+            cv_text=self._cv_text(), hypothesis=asdict(hypothesis), memory=self.memory.summary(800),
+            model_params=MODEL_PARAMS, timeout=cfg.features_timeout)
+        kw = dict(max_tokens=cfg.code_max_tokens, temperature=cfg.code_temperature)
+        answer = self._llm("chat", messages, **kw)
+        code = extract_code(answer)
+        for _ in range(cfg.max_format_fixes):
+            if code is not None:
+                break
+            messages = P.build_format_fix_messages(messages, str(answer or ""))
+            answer = self._llm("chat", messages, **kw)
+            code = extract_code(answer)
+        return code
+
+    def _repair(self, hypothesis: Hypothesis, code: str, error: str) -> str | None:
+        cfg = self.cfg
+        messages = P.build_repair_messages(
+            task_line=self.task_line, columns=self.columns_text, hypothesis=asdict(hypothesis), code=code,
+            error=error, model_params=MODEL_PARAMS, timeout=cfg.features_timeout, error_chars=cfg.error_chars)
+        return extract_code(self._llm("chat", messages, max_tokens=cfg.code_max_tokens,
+                                      temperature=cfg.code_temperature))
+
+    # ---------------------------------------------------------------- эксперимент
+    def _evaluate_code(self, code: str, name: str) -> tuple[Candidate | None, str]:
+        """Проверка кода → песочница → проверка признаков → evaluator. (кандидат, "") или (None, ошибка)."""
+        cfg = self.cfg
+        problems = validate_code(code)
+        consts: dict = {}
+        if not problems:
+            consts, problems = extract_constants(code)
+        if problems:
+            return None, "static check failed: " + "; ".join(problems)
+        model, params, transform, notes = normalize_model_config(consts, self.task_type)
+
+        features = run_features(code, self.workdir / name, self.inputs, self.data, cfg, self.run_code,
+                                timeout=min(cfg.features_timeout, max(1.0, self._left())))
+        if features.error:
+            return None, features.error
+        if self._left() < max(10.0, 0.5 * self.reference_seconds):
+            return None, "no time left to evaluate"
+        try:
+            budget = _SubDeadline(self.deadline, min(cfg.evaluate_timeout, self._left()))
+            cand = self.evaluate(self.spec, make_build_features(features.x_train, features.x_test),
+                                 {"model": model, "params": params, "target_transform": transform}, budget)
+        except Exception as error:
+            return None, f"evaluation failed: {type(error).__name__}: {P.clip(str(error), 1000)}"
+        if cand is None or not math.isfinite(float(getattr(cand, "cv_score", math.nan))):
+            return None, "evaluation returned no finite CV score"
+        if not isinstance(getattr(cand, "meta", None), dict):
+            cand.meta = {}
+        cand.meta.update(code=code, model=model, params=params, target_transform=transform,
+                         n_features=int(features.x_train.shape[1]), harness_notes=notes + features.notes)
+        return cand, ""
+
+    def _iterate(self, hypothesis: Hypothesis) -> None:
+        cfg = self.cfg
+        self.iteration += 1
+        n = self.iteration
+        start, tokens_in, tokens_out = time.monotonic(), self.tokens_in, self.tokens_out
+        status, error, digest = "failed", "", ""
+        cand: Candidate | None = None
+        decision: Decision | None = None
+        try:
+            code = self._write_code(hypothesis)
+            error = "" if code else "answer has no ```python code block"
+            repairs = 0
+            while code is not None:
+                digest = code_hash(code)
+                same = self.memory.find_code(digest)
+                if digest == code_hash(self.base_code) or same is not None:
+                    status = "rejected"
+                    error = (f"same code as experiment #{same.id}" if same is not None
+                             else "no change vs the current best code")
+                    break
+                cand, error = self._evaluate_code(code, f"exp_{n:02d}")
+                if cand is not None or repairs >= cfg.max_repairs or self._left() < self._expected_seconds():
+                    break
+                repairs += 1
+                fixed = self._repair(hypothesis, code, error)
+                if fixed is None:
+                    error += " | repair answer has no code block"
+                code = fixed
+            if cand is not None:
+                decision = decide(cand, self.current, self.greater, cfg)
+                status, error = self._judge(cand, decision, hypothesis, n)
+        except LLMUnavailable:
+            raise
+        except Exception as exc:  # ошибка харнесса на одном эксперименте не должна останавливать цикл
+            log.exception("research: experiment %d crashed", n)
+            status, error = "failed", f"internal error: {type(exc).__name__}: {exc}"
+
+        duration = time.monotonic() - start
+        self.memory.add(Experiment(
+            id=self.memory.next_id(), hypothesis=hypothesis.title, kind=hypothesis.kind, status=status,
+            cv_score=float(cand.cv_score) if cand is not None else None,
+            cv_std=float(cand.cv_std) if cand is not None else None,
+            gain=decision.gain if decision is not None else None, code_hash=digest, error=error[:1000],
+            duration_s=round(duration, 1), tokens_in=self.tokens_in - tokens_in,
+            tokens_out=self.tokens_out - tokens_out))
+        self.durations.append(duration)
+        self.consecutive_failures = self.consecutive_failures + 1 if status == "failed" else 0
+        self.no_improve = 0 if status == "accepted" else self.no_improve + 1
+        self.since_critic += status != "accepted"
+        log.info("research #%d [%s] [%s] %s | %s | %.0fs | tokens %d", n, status, hypothesis.kind,
+                 hypothesis.title, P.clip(error, 300), duration, self.tokens_used())
+        try:
+            self.memory.dump_jsonl(self.workdir / "experiments.jsonl")
+        except OSError:
+            pass
+
+    def _judge(self, cand: Candidate, decision: Decision, hypothesis: Hypothesis, n: int) -> tuple[str, str]:
+        if not decision.accept:
+            return "rejected", decision.reason
+        if decision.suspicious:
+            issues = self._check_guards(cand)
+            if issues:
+                return "rejected", f"suspicious jump, guards: {P.clip('; '.join(map(str, issues)), 300)}"
+            if issues is None:
+                cand.meta["suspicious"] = True
+                log.warning("research: suspicious jump (%s) accepted without guards", decision.reason)
+        cand.name = f"agent_{n:02d}_{hypothesis.kind}"
+        cand.meta.update(hypothesis=hypothesis.title, kind=hypothesis.kind, iter=n, gain=decision.gain,
+                         seconds=round(self.reference_seconds, 1))
+        self.accepted.append(cand)
+        self.current, self.base_code = cand, cand.meta["code"]
+        return "accepted", decision.reason
+
+    def _check_guards(self, cand: Candidate) -> list | None:
+        """guards.check_candidate (P5): список проблем; None — проверить нечем."""
+        if self.guards is None:
+            return None
+        try:
+            return list(self.guards(self.spec, cand, self.current) or [])
+        except Exception as error:
+            log.warning("research: guards failed: %s", error)
+            return None
+
+
 def research(spec: Any, best: Candidate | None, llm: LLMClient | None, deadline: Any, *,
              config: AgentConfig | None = None,
              evaluate: EvaluateFn | None = None,
@@ -874,10 +1383,34 @@ def research(spec: Any, best: Candidate | None, llm: LLMClient | None, deadline:
     Необязательные аргументы — для тестов и для P1: подменить evaluator/песочницу/профиль
     и передать уже загруженные данные. По умолчанию берутся модули команды, если они есть.
     """
+    cfg = config or AgentConfig()
     if llm is None:
         log.info("research: LLM нет — исследование пропущено")
         return []
     if os.environ.get("LLM_DISABLED") == "1" and not getattr(llm, "offline", False):
         log.info("research: LLM_DISABLED=1 — исследование пропущено")
         return []
-    return []
+    left = _time_left(deadline)
+    if left < cfg.min_start_seconds:
+        log.info("research: до конца окна %.0f с < %.0f с — исследование пропущено", left, cfg.min_start_seconds)
+        return []
+    evaluate = evaluate or _optional("evaluator", "evaluate")
+    if evaluate is None:
+        log.warning("research: evaluator.evaluate недоступен — исследование пропущено")
+        return []
+
+    loop = None
+    try:
+        loop = _Research(spec, best, llm, deadline, cfg, evaluate=evaluate,
+                         run_code=run_code or _optional("sandbox", "run_code") or _local_run_code,
+                         profile=profile or _optional("eda", "profile"),
+                         guards=guards or _optional("guards", "check_candidate"), data=data)
+        return loop.run()
+    except LLMUnavailable as error:
+        log.warning("research: LLM недоступна (%s) — возвращаем накопленное", P.clip(str(error), 300))
+    except Exception:
+        log.exception("research: непредвиденная ошибка — возвращаем накопленное")
+    try:
+        return loop.result() if loop is not None else []
+    except Exception:
+        return []

@@ -276,7 +276,7 @@ def make_multiclass_task(root: Path, n_train: int = 450, n_test: int = 150, seed
     n = n_train + n_test
     df = pd.DataFrame({"id": np.arange(n), "a": rng.normal(size=n), "b": rng.normal(size=n),
                        "proto": rng.choice(["tcp", "udp", "icmp"], n)})
-    score = df.a * df.b + rng.normal(scale=0.3, size=n)
+    score = df.a * df.b + rng.normal(scale=0.05, size=n)
     label = np.where(score > 0.4, "high", np.where(score < -0.4, "low", "mid"))
     root.mkdir(parents=True, exist_ok=True)
     df.iloc[:n_train].assign(kind=label[:n_train]).to_csv(root / "train.csv", index=False)
