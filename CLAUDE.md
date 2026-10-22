@@ -127,7 +127,7 @@ print(response.choices[0].message.content)
 | P2 | LLM-инфраструктура и понимание задачи | `llm_client.py`, `task_understanding.py`, `prompts_task.py` | `feature/llm-client`, `feature/task-understanding` |
 | P3 | ML-ядро: fallback, предобработка, метрики | `fallback.py`, `preprocess.py`, `metrics.py`, `submission.py` | `feature/fallback-pipeline`, `feature/metrics-submission`, `feature/preprocess-v2` |
 | P4 — **@egrsid** | AutoResearch-агент (LLM-управляемый цикл) | `agent.py`, `prompts_agent.py`, `memory.py` (память экспериментов) | `feature/agent-loop`, `feature/experiment-memory`, `feature/agent-strategies` |
-| P5 | Песочница, защита, тесты универсальности | `sandbox.py`, `guards.py`, `tests/` (вне ZIP), `make_datasets.py` (вне ZIP, в `tools/`) | `feature/sandbox`, `feature/guards-validation`, `feature/test-datasets`, `feature/docker-check` |
+| P5 — **@m1cckey** | Песочница, защита, тесты универсальности | `sandbox.py`, `guards.py`, `tests/` (вне ZIP), `make_datasets.py` (вне ZIP, в `tools/`) | `feature/sandbox`, `feature/guards-validation`, `feature/test-datasets`, `feature/docker-check` |
 
 **P1 — тимлид, интеграция, харнесс оценки, тюнинг, ансамбль**
 - `evaluator.py` — ключевой модуль честной оценки (на нём стоит и агент P4, и fallback P3): фиксированные CV-сплиты (stratified/group/time по `TaskSpec`, один сид на весь запуск), функция `evaluate(spec, build_features, model_params, ...) -> Candidate` с OOF и test-предсказаниями, шум CV (std по фолдам) для порога «улучшение реально», отложенная часть train, которую агент не видит (hold-out для финальной проверки на переобучение под CV). Метрику считает через `metrics.score`.
