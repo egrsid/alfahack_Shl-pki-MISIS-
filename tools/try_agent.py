@@ -4,6 +4,7 @@
 
     .venv/bin/python tools/try_agent.py "Регрессия/task.md" --dry-run     # без LLM: проверка трубы и размера промптов
     .venv/bin/python tools/try_agent.py "Регрессия/task.md" --iters 3     # живой Qwen
+    .venv/bin/python tools/try_agent.py "Регрессия/task.md" --dry-run --tune   # + подбор (StubTuner, пока нет P1)
 
 Ключ и адрес — из переменных окружения или .env (python-dotenv). Оценка — StubEvaluator из tests/mocks.py
 (или evaluator.evaluate, когда P1 смержит харнесс). Спецификация задачи — эвристики ниже (до task_understanding P2).
@@ -28,7 +29,8 @@ sys.path[:0] = [str(ROOT), str(ROOT / "tests")]
 
 import agent  # noqa: E402
 import prompts_agent as P  # noqa: E402
-from mocks import MockLLM, SimpleDeadline, SpecStub, StubEvaluator, fenced, make_best, plan  # noqa: E402
+from mocks import (LIGHTGBM_GRID, MockLLM, SimpleDeadline, SpecStub, StubEvaluator, StubTuner, fenced,  # noqa: E402
+                   make_best, plan)
 
 METRICS = [(r"macro[\s_-]*f1|f1[\s_-]*macro", "macro_f1", True), (r"weighted[\s_-]*f1", "weighted_f1", True),
            (r"\brmse\b", "rmse", False), (r"\bmae\b", "mae", False), (r"roc[\s_-]*auc|\bauc\b", "roc_auc", True),
@@ -157,6 +159,8 @@ def main() -> int:
     parser.add_argument("--trees", type=int, default=300, help="деревьев в StubEvaluator")
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--dry-run", action="store_true", help="MockLLM вместо Qwen: бюджет не тратится")
+    parser.add_argument("--tune", action="store_true",
+                        help="вид гипотезы tune: tuning.tune (P1) или, без него, перебор сетки StubTuner")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s", datefmt="%H:%M:%S")
 
@@ -192,7 +196,12 @@ def main() -> int:
 
     config = agent.AgentConfig(max_iters=args.iters, max_tokens=args.max_tokens, min_start_seconds=60)
     start = time.monotonic()
-    result = agent.research(spec, best, llm, SimpleDeadline(args.minutes * 60), config=config, evaluate=evaluate)
+    tuner = None
+    if args.tune:
+        tuner = agent._optional("tuning", "tune") or StubTuner(evaluator=evaluate, grid=LIGHTGBM_GRID,
+                                                                greater_is_better=spec.greater_is_better)
+    result = agent.research(spec, best, llm, SimpleDeadline(args.minutes * 60), config=config, evaluate=evaluate,
+                            tuner=tuner)
     seconds = time.monotonic() - start
 
     workdir = spec.task_dir / config.workdir_name
