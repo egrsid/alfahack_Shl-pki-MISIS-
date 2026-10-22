@@ -32,6 +32,7 @@ import numpy as np
 import pandas as pd
 
 import prompts_agent as P
+from error_analysis import analyze_errors
 from memory import Experiment, ExperimentMemory, code_diff, code_hash, columns_in, normalize_title
 
 log = logging.getLogger("agent")
@@ -118,6 +119,7 @@ class AgentConfig:
     task_text_chars: int = 1200
     memory_chars: int = 1500
     coder_memory_chars: int = 900       # кодеру: принятые шаги с диффом и 4 последних эксперимента
+    errors_chars: int = 800             # сводка «где ошибается модель» для планировщика (0 — не считать)
     error_chars: int = 1500
     # файлы
     workdir_name: str = ".agent_work"
@@ -1043,6 +1045,7 @@ class _Research:
         self.current: Candidate | None = None
         self.base_code = BASE_CODE
         self.insights = ""
+        self.errors_text = ""
         self.llm_extra = dict(cfg.llm_extra)
         self.tokens_in = self.tokens_out = self.llm_calls = 0
         self.iteration = self.consecutive_failures = self.no_improve = self.empty_plans = self.since_critic = 0
@@ -1122,6 +1125,7 @@ class _Research:
         if meta.get("code") and math.isfinite(float(self.best.cv_score)):
             self.base_code, self.current = meta["code"], self.best
             self.reference_seconds = float(meta.get("seconds", self.reference_seconds))
+            self._update_errors()
             return True
         start = time.monotonic()
         cand, error = self._evaluate_code(BASE_CODE, "exp_00_base")
@@ -1133,7 +1137,20 @@ class _Research:
         best_cv = f"{float(self.best.cv_score):.5g}" if self.best is not None else "n/a"
         log.info("research: reference %s=%.5g (input best %s), %.0fs", self.data.spec_dict["metric"],
                  cand.cv_score, best_cv, self.reference_seconds)
+        self._update_errors()
         return True
+
+    def _update_errors(self) -> None:
+        """Где ошибается текущий лучший: OOF против таргета в процессе харнесса, в промпт — только агрегаты."""
+        if self.cfg.errors_chars <= 0 or self.current is None:
+            return
+        start = time.monotonic()
+        meta = getattr(self.current, "meta", None) or {}
+        self.errors_text = analyze_errors(
+            self.data.train_x, self.data.y, getattr(self.current, "oof", None), self.task_type,
+            classes=meta.get("classes"), cat_cols=self.data.spec_dict["cat_cols"], max_chars=self.cfg.errors_chars)
+        log.info("research: error analysis %s in %.1fs", "updated" if self.errors_text else "unavailable",
+                 time.monotonic() - start)
 
     def _finish(self) -> None:
         log.info("research: stop (%s); experiments %d, accepted %d, LLM calls %d, tokens in/out %d/%d",
@@ -1229,7 +1246,7 @@ class _Research:
         cfg = self.cfg
         messages = P.build_plan_messages(
             task_line=self.task_line, task_text=self.task_text, profile=self.profile_text, base_code=self.base_code,
-            cv_text=self._cv_text(), n=cfg.hypotheses_per_plan,
+            cv_text=self._cv_text(), n=cfg.hypotheses_per_plan, errors=self.errors_text,
             memory=self.memory.planner_brief(cfg.memory_chars, kinds=P.KINDS, task_type=self.task_type),
             task_chars=cfg.task_text_chars, profile_chars=cfg.profile_chars, memory_chars=cfg.memory_chars)
         kw = dict(max_tokens=cfg.plan_max_tokens, temperature=cfg.plan_temperature)
@@ -1434,6 +1451,7 @@ class _Research:
                          seconds=round(self.reference_seconds, 1))
         self.accepted.append(cand)
         self.current, self.base_code = cand, cand.meta["code"]
+        self._update_errors()
         return "accepted", decision.reason
 
     def _check_guards(self, cand: Candidate) -> list | None:

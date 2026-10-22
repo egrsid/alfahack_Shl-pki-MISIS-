@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-AGENT_FILES = ("agent.py", "prompts_agent.py", "memory.py")
+AGENT_FILES = ("agent.py", "prompts_agent.py", "memory.py", "error_analysis.py")
 TEAM_MODULES = {"schemas", "llm_client", "evaluator", "sandbox", "eda", "guards", "budget"}
 
 # так solution.py (P1) вызывает агента: после fallback, в try/except, submission.csv пишет только сам
@@ -72,7 +72,7 @@ def _top_level_imports(path: Path) -> set[str]:
 
 
 def test_agent_modules_import_only_stdlib_numpy_pandas():
-    allowed = set(sys.stdlib_module_names) | {"numpy", "pandas", "prompts_agent", "memory"}
+    allowed = set(sys.stdlib_module_names) | {"numpy", "pandas", "prompts_agent", "memory", "error_analysis"}
     for name in AGENT_FILES:
         extra = _top_level_imports(ROOT / name) - allowed
         assert not extra, f"{name}: unconditional imports {extra}"

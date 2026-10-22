@@ -147,6 +147,7 @@ differences, group statistics and counts across rows, which trees cannot build t
 - The target is NOT available to feature code: no target encoding, no target statistics.
 - No external data; never use row order or row index as a feature.
 - Do not repeat what the memory says was already tried.
+- If an error analysis is given, prefer hypotheses that target the worst segments, classes or target ranges.
 
 Answer with ONE JSON object and nothing else:
 {{"analysis": "<= 60 words: key data insights", "hypotheses": [{{"id": "h1", "title": "...", "kind": "features", \
@@ -220,11 +221,13 @@ def _hypothesis_text(hypothesis: dict) -> str:
 
 def build_plan_messages(*, task_line: str, task_text: str, profile: str, base_code: str, cv_text: str,
                         memory: str, n: int = 6, task_chars: int = 1200, profile_chars: int = 5000,
-                        code_chars: int = 2000, memory_chars: int = 1500) -> list[dict]:
+                        code_chars: int = 2000, memory_chars: int = 1500, errors: str = "",
+                        errors_chars: int = 800) -> list[dict]:
     user = (f"## Task\n{task_line}\n{clip(task_text, task_chars)}\n\n"
             f"## Data profile\n{clip(profile, profile_chars)}\n\n"
             f"## Current best solution ({cv_text})\n```python\n{clip(base_code, code_chars)}\n```\n\n"
-            f"## Memory\n{clip(memory, memory_chars)}\n\n"
+            + (f"## Where the current model errs\n{clip(errors, errors_chars)}\n\n" if errors else "")
+            + f"## Memory\n{clip(memory, memory_chars)}\n\n"
             f"Propose up to {n} new hypotheses as ONE JSON object.")
     return [{"role": "system", "content": PLANNER_SYSTEM.format(n=n)}, {"role": "user", "content": user}]
 

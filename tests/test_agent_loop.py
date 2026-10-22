@@ -230,6 +230,35 @@ def test_coder_sees_diff_of_accepted_steps(reg_task):
     assert '    + df["x1_x2"] = df["x1"] * df["x2"]' in second
 
 
+# ---------------------------------------------------------------- анализ худших объектов
+
+def test_planner_gets_error_analysis_and_it_is_refreshed_after_accept(reg_task):
+    llm = MockLLM({"planner": [plan("Interaction x1*x2")], "coder": [fenced(GOOD_CODE)]})
+    run_research(reg_task, llm)
+    first, replan = planner_prompts(llm)[0], planner_prompts(llm)[-1]
+    assert "## Where the current model errs\nError analysis of the current best model (out-of-fold):" in first
+    section = lambda text: text.split("## Where the current model errs")[1].split("## Memory")[0]
+    assert section(first) != section(replan)  # после принятия x1*x2 ошибки другие
+
+
+def test_error_analysis_can_be_disabled(reg_task):
+    llm = MockLLM({"planner": [plan("Interaction x1*x2")], "coder": [fenced(GOOD_CODE)]})
+    run_research(reg_task, llm, errors_chars=0)
+    assert all("Where the current model errs" not in p for p in planner_prompts(llm))
+
+
+def test_broken_oof_does_not_break_research(reg_task):
+    class NoOof(StubEvaluator):
+        def __call__(self, *args, **kw):
+            cand = super().__call__(*args, **kw)
+            cand.oof = None
+            return cand
+
+    llm = MockLLM({"planner": [plan("Interaction x1*x2")], "coder": [fenced(GOOD_CODE)]})
+    result, _, _ = run_research(reg_task, llm, evaluator=NoOof(n_splits=3, n_estimators=60))
+    assert len(result) == 1 and all("Where the current model errs" not in p for p in planner_prompts(llm))
+
+
 # ---------------------------------------------------------------- рассуждающая модель (qwen3.8)
 
 class BadRequest(Exception):
