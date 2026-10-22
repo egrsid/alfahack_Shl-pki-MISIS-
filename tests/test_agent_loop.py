@@ -200,6 +200,20 @@ def test_rephrased_duplicates_within_one_plan_are_dropped(reg_task):
     assert [r["hypothesis"] for r in experiments(reg_task)] == ["Interaction x1*x2", "Scaled x3"]
 
 
+def planner_prompts(llm):
+    return [messages[-1]["content"] for role, messages, _ in llm.calls if role == "planner"]
+
+
+def test_replan_prompt_shows_coverage(reg_task):
+    llm = MockLLM({"planner": [plan("Interaction x1*x2")], "coder": [fenced(GOOD_CODE)]})
+    run_research(reg_task, llm)
+    first, replan = planner_prompts(llm)[0], planner_prompts(llm)[-1]
+    assert "No experiments yet." in first
+    assert "Kinds not tried yet: encoding, missing, outliers, target_transform" in replan
+    assert "Columns no experiment has used yet: x3, city" in replan
+    assert "[accepted] features | Interaction x1*x2" in replan
+
+
 # ---------------------------------------------------------------- рассуждающая модель (qwen3.8)
 
 class BadRequest(Exception):

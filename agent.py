@@ -1228,7 +1228,8 @@ class _Research:
         cfg = self.cfg
         messages = P.build_plan_messages(
             task_line=self.task_line, task_text=self.task_text, profile=self.profile_text, base_code=self.base_code,
-            cv_text=self._cv_text(), memory=self.memory.summary(cfg.memory_chars), n=cfg.hypotheses_per_plan,
+            cv_text=self._cv_text(), n=cfg.hypotheses_per_plan,
+            memory=self.memory.planner_brief(cfg.memory_chars, kinds=P.KINDS, task_type=self.task_type),
             task_chars=cfg.task_text_chars, profile_chars=cfg.profile_chars, memory_chars=cfg.memory_chars)
         kw = dict(max_tokens=cfg.plan_max_tokens, temperature=cfg.plan_temperature)
         data: Any = None
