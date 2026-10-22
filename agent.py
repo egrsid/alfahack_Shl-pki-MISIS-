@@ -15,6 +15,7 @@ import ast
 import importlib
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -808,6 +809,57 @@ def make_build_features(x_train: pd.DataFrame, x_test: pd.DataFrame) -> Callable
         return _rows_like(x_train, train), _rows_like(x_test, test)
 
     return build_features
+
+
+# ============================================================ решение «принять / отклонить»
+
+@dataclass
+class Decision:
+    accept: bool
+    gain: float           # > 0 — лучше с учётом направления метрики
+    threshold: float
+    noise: float          # стандартная ошибка разницы CV
+    suspicious: bool = False
+    reason: str = ""
+
+
+def _fold_scores(cand: Candidate) -> np.ndarray | None:
+    scores = (getattr(cand, "meta", None) or {}).get("fold_scores")
+    try:
+        values = np.asarray(scores, dtype=float)
+    except (TypeError, ValueError):
+        return None
+    return values if values.ndim == 1 and len(values) and np.isfinite(values).all() else None
+
+
+def decide(new: Candidate, current: Candidate, greater_is_better: bool, cfg: AgentConfig) -> Decision:
+    """Принять, если выигрыш больше шума CV (accept_k · SE) и больше min_rel_gain · |cv|.
+
+    Сплиты у кандидатов одинаковые, поэтому при наличии fold_scores шум — SE парных разностей по фолдам;
+    иначе — cv_std / sqrt(n_folds) текущего лучшего.
+    """
+    new_score, cur_score = float(new.cv_score), float(current.cv_score)
+    if not math.isfinite(new_score):
+        return Decision(False, math.nan, math.inf, math.nan, reason="CV score is not finite")
+    if not math.isfinite(cur_score):
+        return Decision(True, math.inf, 0.0, 0.0, reason="current best has no finite CV score")
+    sign = 1.0 if greater_is_better else -1.0
+    gain = sign * (new_score - cur_score)
+
+    ours, theirs = _fold_scores(new), _fold_scores(current)
+    if ours is not None and theirs is not None and len(ours) == len(theirs) >= 2:
+        diffs = sign * (ours - theirs)
+        noise, source = float(np.std(diffs, ddof=1) / math.sqrt(len(diffs))), "paired folds"
+    else:
+        folds = len(theirs) if theirs is not None else cfg.default_n_folds
+        std = float(current.cv_std) if math.isfinite(float(current.cv_std)) else 0.0
+        noise, source = std / math.sqrt(max(1, folds)), "fold std"
+
+    threshold = max(cfg.accept_k * noise, cfg.min_rel_gain * abs(cur_score))
+    accept = gain > threshold
+    suspicious = accept and gain > cfg.suspicious_k * noise and gain > cfg.suspicious_rel * abs(cur_score)
+    reason = f"gain {gain:+.5g} {'>' if accept else '<='} threshold {threshold:.5g} (noise {noise:.3g}, {source})"
+    return Decision(accept, gain, threshold, noise, suspicious, reason)
 
 
 def research(spec: Any, best: Candidate | None, llm: LLMClient | None, deadline: Any, *,
