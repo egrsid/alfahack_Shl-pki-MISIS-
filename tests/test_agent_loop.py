@@ -214,6 +214,15 @@ def test_replan_prompt_shows_coverage(reg_task):
     assert "[accepted] features | Interaction x1*x2" in replan
 
 
+def test_coder_sees_diff_of_accepted_steps(reg_task):
+    llm = MockLLM({"planner": [plan("Interaction x1*x2", "Scaled x3")],
+                   "coder": [fenced(GOOD_CODE), fenced(GOOD_ON_TOP)]})
+    run_research(reg_task, llm)
+    second = coder_prompts(llm)[1]
+    assert "Accepted steps (already in the current best):" in second
+    assert '    + df["x1_x2"] = df["x1"] * df["x2"]' in second
+
+
 # ---------------------------------------------------------------- рассуждающая модель (qwen3.8)
 
 class BadRequest(Exception):

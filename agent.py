@@ -117,6 +117,7 @@ class AgentConfig:
     profile_chars: int = 5000
     task_text_chars: int = 1200
     memory_chars: int = 1500
+    coder_memory_chars: int = 900       # кодеру: принятые шаги с диффом и 4 последних эксперимента
     error_chars: int = 1500
     # файлы
     workdir_name: str = ".agent_work"
@@ -1293,7 +1294,8 @@ class _Research:
         cfg = self.cfg
         messages = P.build_code_messages(
             task_line=self.task_line, columns=self.columns_text, insights=self.insights, base_code=self.base_code,
-            cv_text=self._cv_text(), hypothesis=asdict(hypothesis), memory=self.memory.summary(800),
+            cv_text=self._cv_text(), hypothesis=asdict(hypothesis),
+            memory=self.memory.summary(cfg.coder_memory_chars, recent=4), memory_chars=cfg.coder_memory_chars,
             model_params=MODEL_PARAMS, timeout=cfg.features_timeout)
         kw = dict(max_tokens=cfg.code_max_tokens, temperature=cfg.code_temperature)
         answer = self._llm("chat", messages, **kw)
