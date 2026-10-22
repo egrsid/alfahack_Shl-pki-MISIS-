@@ -207,7 +207,7 @@ def test_summary_sections_on_long_history():
     assert "By kind: " in text
     for kind in ["features", "encoding", "params", "missing", "model", "feature_selection"]:
         assert f"{kind}: " in text, kind
-    assert "1 accepted (best gain +2)" in text  # #20 — model
+    assert "1 accepted (best gain +2)" in text  # #20 — params
     assert "failed (timeout)" in text or "failed (KeyError)" in text
     assert "Recent experiments (oldest first):" in text
 
@@ -230,3 +230,33 @@ def test_summary_short_history_has_no_kind_totals():
     memory = ExperimentMemory()
     exp(memory, "a", "rejected", cv_score=1.0, gain=-0.1)
     assert "By kind" not in memory.summary() and "Recent experiments" in memory.summary()
+
+
+KINDS = ("features", "encoding", "missing", "outliers", "target_transform", "params", "model", "feature_selection")
+
+
+def test_coverage_untried_exhausted_untouched():
+    memory = ExperimentMemory(columns=COLUMNS)
+    for i in range(3):
+        exp(memory, f"params try {i}", "rejected", kind="params")
+    exp(memory, "Ratio sbytes / dbytes", "accepted", kind="features", columns=["sbytes", "dbytes"])
+    exp(memory, "Count encoding of facility_type", "failed", kind="encoding")  # колонка из названия
+    cov = memory.coverage(kinds=KINDS, task_type="multiclass")
+    assert cov["untried_kinds"] == ["missing", "outliers", "model", "feature_selection"]  # без target_transform
+    assert cov["exhausted_kinds"] == ["params"]
+    assert {"sbytes", "dbytes", "facility_type"}.isdisjoint(cov["untouched_columns"])
+    assert cov["n_untouched_columns"] == len(COLUMNS) - 3
+    assert "target_transform" in memory.coverage(kinds=KINDS, task_type="regression")["untried_kinds"]
+    assert len(memory.coverage(kinds=KINDS, max_columns=4)["untouched_columns"]) == 4
+
+
+def test_planner_brief_appends_coverage_and_fits():
+    memory = long_history()
+    for max_chars in (600, 1500):
+        text = memory.planner_brief(max_chars, kinds=KINDS, task_type="regression")
+        assert len(text) <= max_chars
+        assert "Kinds not tried yet: outliers, target_transform" in text
+        assert text.rstrip().splitlines()[-1].startswith(("Columns no experiment", "Exhausted", "Kinds not"))
+    assert "Exhausted (3+ tries, nothing accepted)" in memory.planner_brief(1500, kinds=KINDS)
+    assert "features" in memory.planner_brief(1500, kinds=KINDS).split("Exhausted")[1]
+    assert ExperimentMemory().planner_brief(kinds=KINDS) == "No experiments yet."

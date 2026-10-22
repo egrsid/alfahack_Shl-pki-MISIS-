@@ -277,6 +277,46 @@ class ExperimentMemory:
             lines.append(f"{kind}: {', '.join(parts)}")
         return lines
 
+    def coverage(self, all_columns: Iterable[str] | None = None, kinds: Iterable[str] = (), task_type: str = "",
+                 max_columns: int = 15, exhausted_after: int = 3) -> dict:
+        """Что ещё не пробовали: виды гипотез без попыток, исчерпанные виды (exhausted_after+ попыток без
+        принятия), исходные колонки, которых не касался ни один эксперимент (по диффу и по названию)."""
+        all_columns = list(self.columns if all_columns is None else all_columns)
+        kinds = [k for k in kinds if k != "target_transform" or task_type in ("", "regression")]
+        groups: dict[str, list[Experiment]] = {}
+        used: set[str] = set()
+        for exp in self.experiments:
+            groups.setdefault(exp.kind, []).append(exp)
+            used.update(exp.columns, mentioned_columns(exp.hypothesis, all_columns))
+        untouched = [c for c in all_columns if c not in used]
+        return {"untried_kinds": [k for k in kinds if k not in groups],
+                "exhausted_kinds": [k for k, exps in groups.items()
+                                    if len(exps) >= exhausted_after and all(e.status != "accepted" for e in exps)],
+                "untouched_columns": untouched[:max_columns], "n_untouched_columns": len(untouched)}
+
+    def planner_brief(self, max_chars: int = 1500, all_columns: Iterable[str] | None = None,
+                      kinds: Iterable[str] = (), task_type: str = "") -> str:
+        """Для планировщика: сводка + куда ещё не смотрели и что исчерпано (в конце — ближе к вопросу)."""
+        if not self.experiments:
+            return self.summary(max_chars)
+        cov = self.coverage(all_columns, kinds, task_type)
+        lines = []
+        if cov["untried_kinds"]:
+            lines.append("Kinds not tried yet: " + ", ".join(cov["untried_kinds"]))
+        if cov["exhausted_kinds"]:
+            lines.append("Exhausted (3+ tries, nothing accepted), propose only a clearly new idea: "
+                         + ", ".join(cov["exhausted_kinds"]))
+        if cov["untouched_columns"]:
+            more = cov["n_untouched_columns"] - len(cov["untouched_columns"])
+            lines.append("Columns no experiment has used yet: " + ", ".join(cov["untouched_columns"])
+                         + (f" (+{more} more)" if more else ""))
+        tail = "\n".join(lines)
+        if len(tail) > max_chars // 3:
+            tail = tail[: max_chars // 3 - 3] + "..."
+        if not tail:
+            return self.summary(max_chars)
+        return self.summary(max_chars - len(tail) - 1) + "\n" + tail
+
     def summary(self, max_chars: int = 1500, recent: int = 8) -> str:
         """Сводка для промпта. Секции по приоритету, при нехватке места режется низший:
         принятые шаги (с диффом) > итог по видам > последние эксперименты > «уже пробовали» > заметки критика.
