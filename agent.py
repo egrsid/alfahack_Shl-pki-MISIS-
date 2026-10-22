@@ -32,7 +32,7 @@ import numpy as np
 import pandas as pd
 
 import prompts_agent as P
-from memory import Experiment, ExperimentMemory, code_hash, normalize_title
+from memory import Experiment, ExperimentMemory, code_diff, code_hash, columns_in, normalize_title
 
 log = logging.getLogger("agent")
 
@@ -1084,6 +1084,7 @@ class _Research:
         cfg = self.cfg
         self.data = self.data or load_task_data(self.spec)
         self.task_type = self.data.spec_dict["task_type"]
+        self.memory.columns = [str(c) for c in self.data.train_x.columns]
         self.inputs = write_inputs(self.data, self.workdir)
 
         mini = _mini_profile(self.data)
@@ -1328,6 +1329,7 @@ class _Research:
         n = self.iteration
         start, tokens_in, tokens_out = time.monotonic(), self.tokens_in, self.tokens_out
         status, error, digest = "failed", "", ""
+        base_code, last_code = self.base_code, None  # база до эксперимента: _judge её заменит при принятии
         cand: Candidate | None = None
         decision: Decision | None = None
         try:
@@ -1335,6 +1337,7 @@ class _Research:
             error = "" if code else "answer has no ```python code block"
             repairs = 0
             while code is not None:
+                last_code = code
                 digest = code_hash(code)
                 same = self.memory.find_code(digest)
                 if digest == code_hash(self.base_code) or same is not None:
@@ -1363,13 +1366,15 @@ class _Research:
             status, error = "failed", f"internal error: {type(exc).__name__}: {exc}"
 
         duration = time.monotonic() - start
+        changed = code_diff(base_code, last_code, max_lines=0) if last_code else ""
         self.memory.add(Experiment(
             id=self.memory.next_id(), hypothesis=hypothesis.title, kind=hypothesis.kind, status=status,
             cv_score=float(cand.cv_score) if cand is not None else None,
             cv_std=float(cand.cv_std) if cand is not None else None,
             gain=decision.gain if decision is not None else None, code_hash=digest, error=error[:1000],
             duration_s=round(duration, 1), tokens_in=self.tokens_in - tokens_in,
-            tokens_out=self.tokens_out - tokens_out))
+            tokens_out=self.tokens_out - tokens_out, columns=columns_in(changed, self.memory.columns),
+            diff=code_diff(base_code, last_code) if last_code else "", base_hash=code_hash(base_code)))
         self.durations.append(duration)
         self.consecutive_failures = self.consecutive_failures + 1 if status == "failed" else 0
         self.no_improve = 0 if status == "accepted" else self.no_improve + 1

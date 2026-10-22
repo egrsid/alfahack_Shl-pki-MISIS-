@@ -170,6 +170,19 @@ def test_ignored_params_are_reported_to_memory(reg_task):
     assert row["status"] == "accepted" and "is_unbalance" in row["error"] and "num_leaves" not in row["error"]
 
 
+# ---------------------------------------------------------------- память экспериментов
+
+def test_experiment_records_diff_columns_and_base(reg_task):
+    llm = MockLLM({"planner": [plan("Interaction x1*x2", "Scaled x3")],
+                   "coder": [fenced(GOOD_CODE), fenced(GOOD_ON_TOP)]})
+    run_research(reg_task, llm)
+    rows = experiments(reg_task)
+    assert rows[0]["columns"] == ["x1", "x2"] and 'df["x1_x2"] = df["x1"] * df["x2"]' in rows[0]["diff"]
+    assert rows[0]["base_hash"] == agent.code_hash(agent.BASE_CODE)
+    assert rows[1]["base_hash"] == agent.code_hash(GOOD_CODE)  # кумулятивно: база — принятый #1
+    assert rows[1]["columns"] == ["x3"] and "x1_x2" not in rows[1]["diff"]
+
+
 # ---------------------------------------------------------------- рассуждающая модель (qwen3.8)
 
 class BadRequest(Exception):
