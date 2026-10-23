@@ -56,7 +56,7 @@ def test_imbalanced_macro_f1_plans_balanced_variant(tmp_path):
     counts = np.bincount(data.y)
     assert counts.max() / counts.min() >= 5
     names = [name for name, _, _ in F._plan(data, F.FallbackConfig())]
-    assert names == ["lightgbm", "catboost", "lightgbm_balanced", "xgboost"]
+    assert names == ["lightgbm", "lightgbm_balanced", "xgboost", "catboost"]
 
 
 def test_failing_model_does_not_break_others(tmp_path, monkeypatch):
@@ -230,7 +230,10 @@ def test_label_shift_detected_and_used(tmp_path):
     test = test.drop(columns="label")
     test.insert(0, "id", range(4000, 6000))
     write_task(tmp_path, train, test, pd.DataFrame({"id": test.id, "label": "a"}))
-    cand = F.run(Spec(tmp_path, "id", "label", "multiclass", "macro_f1", True), config=_cfg())
+    spec = Spec(tmp_path, "id", "label", "multiclass", "macro_f1", True)
+    default = F.run(spec, config=_cfg())  # по умолчанию — только диагностика
+    assert default.meta["label_shift"]["used"] is False and default.meta["label_shift"]["tv"] > 0.2
+    cand = F.run(spec, config=_cfg(label_shift=True))
     shift = cand.meta["label_shift"]
     assert shift["used"] and shift["tv"] > 0.2 and abs(shift["test"]["c"] - 0.4) < 0.08
     assert submission.check_file(Spec(tmp_path, "id", "label", "multiclass", "macro_f1", True)) == []

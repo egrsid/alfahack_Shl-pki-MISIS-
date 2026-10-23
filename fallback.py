@@ -75,14 +75,18 @@ class FallbackConfig:
     n_splits: int = 5
     seed: int = 42                   # тот же сид, что у заглушки evaluator P4: при cv="random" сплиты совпадают
     cv: str = "auto"                 # auto — схема по данным (период / дубли / случайная), random — всегда (Stratified)KFold
-    models: tuple[str, ...] = ("lightgbm", "catboost", "xgboost")
+    models: tuple[str, ...] = ("lightgbm", "xgboost", "catboost")  # CatBoost последним: на public медленнее и слабее
     max_rounds: int = 5000
     early_stopping: int = 100
     try_log_target: bool = True
     try_balanced: bool = True        # LightGBM с class_weight=balanced для F1-подобных метрик при дисбалансе
     blend: bool = True
     decision: bool = True            # порог / веса классов для F1-подобных метрик
-    label_shift: bool = True         # учитывать сдвиг пропорций классов train → test (EM), если он надёжно найден
+    # учитывать сдвиг пропорций классов train → test (EM). По умолчанию выключено: на OOF public-мультикласса с
+    # искусственным сдвигом коррекция ухудшила Macro F1 во всех сценариях (−0.004…−0.059) — EM не различает
+    # похожие классы (DoS/Backdoor/Analysis). Оценка пропорций всё равно считается и пишется в meta как диагностика.
+    label_shift: bool = False
+    job_cap_units: float = 4.0       # потолок времени на модель после первой: N × время первого LightGBM
     decision_seconds: float = 40.0
     write: bool = True
     threads: int | None = None
@@ -563,12 +567,13 @@ def _fold_scores(data: TaskData, oof: np.ndarray) -> list[float]:
 def blend(data: TaskData, runs: list[Run], max_steps: int = 30) -> tuple[np.ndarray, np.ndarray, dict] | None:
     """Жадный отбор с возвращением (Caruana) по OOF; None — если отбор оставил одну модель.
 
-    Для классификации отбор идёт по logloss: argmax-метрики (F1, accuracy) ступенчатые и плохо ведут жадный поиск;
-    итоговое сравнение с одиночными моделями — по метрике задачи с порогом/весами классов (consider в run).
+    Отбор — по метрике задачи (на public-мультиклассе отбор по logloss отбрасывал balanced-модель, лучшую по Macro F1,
+    и давал бленд хуже одиночных); веса подобраны на тех же OOF, поэтому в run бленд принимается только с выигрышем
+    больше шума по фолдам, с порогом/весами классов.
     """
     if len(runs) < 2:
         return None
-    select = data.metric if data.task == "regression" else "logloss"
+    select = data.metric
     counts = np.zeros(len(runs))
     current, best = None, None
     for step in range(max_steps):
@@ -591,10 +596,10 @@ def blend(data: TaskData, runs: list[Run], max_steps: int = 30) -> tuple[np.ndar
     return oof, test_pred, {r.name: round(float(w), 4) for w, r in zip(weights, runs) if w > 0}
 
 
-def detect_label_shift(data: TaskData, run: Run, min_tv: float = 0.03, max_sanity_tv: float = 0.02) -> dict:
-    """Пропорции классов в test по калиброванной модели (EM). used=True — сдвиг заметный и оценке можно верить.
-
-    Проверка калибровки: EM по OOF той же модели должен вернуть пропорции train (sanity_tv мал).
+def detect_label_shift(data: TaskData, run: Run, min_tv: float = 0.03, max_sanity_tv: float = 0.02,
+                       apply: bool = False) -> dict:
+    """Пропорции классов в test по калиброванной модели (EM). used=True — коррекция включена (apply), сдвиг заметный
+    и калибровка в порядке (EM по OOF той же модели возвращает пропорции train). Иначе — только диагностика.
     """
     k = len(data.classes or [])
     train = np.bincount(data.y, minlength=k) / len(data.y)
@@ -604,7 +609,7 @@ def detect_label_shift(data: TaskData, run: Run, min_tv: float = 0.03, max_sanit
     info = {"train": dict(zip(data.classes, np.round(train, 4).tolist())),
             "test": dict(zip(data.classes, np.round(test, 4).tolist())),
             "tv": round(tv, 4), "sanity_tv": round(sanity_tv, 4), "model": run.name,
-            "used": bool(tv >= min_tv and sanity_tv <= max_sanity_tv)}
+            "used": bool(apply and tv >= min_tv and sanity_tv <= max_sanity_tv)}
     if info["used"]:
         data.shift_weights = (test / np.clip(train, 1e-12, None))[data.y]
     return info
@@ -698,11 +703,9 @@ def _plan(data: TaskData, cfg: FallbackConfig) -> list[tuple[str, str, dict]]:
             counts = np.bincount(data.y)
             if counts[counts > 0].max() / counts[counts > 0].min() >= 5:
                 jobs.append(("lightgbm_balanced", "lightgbm", {"class_weight": "balanced"}))
-    # balanced — после CatBoost: сначала разные модели, потом вариации
-    balanced = [j for j in jobs if j[0] == "lightgbm_balanced"]
-    jobs = [j for j in jobs if j[0] != "lightgbm_balanced"]
-    if balanced:
-        jobs.insert(min(2, len(jobs)), balanced[0])
+    # balanced идёт сразу за LightGBM: он дешёвый и на public-мультиклассе лучший по Macro F1.
+    # Второй пресет LightGBM (глубже, lr 0.03, сильнее регуляризация) проверен на public и не взят: хуже базового на
+    # обеих задачах (RMSE 45.59 против 44.72, Macro F1 0.601 против 0.604) при 80–138 с времени.
     return jobs
 
 
@@ -752,13 +755,13 @@ def run(spec: Any, deadline: Any = None, config: FallbackConfig | None = None) -
 
     def accept(result: Run) -> None:
         runs.append(result)
-        if (data.task != "regression" and data.label_shift is None and cfg.label_shift
+        if (data.task != "regression" and data.label_shift is None
                 and result.params.get("class_weight") is None):
             try:
-                data.label_shift = detect_label_shift(data, result)
+                data.label_shift = detect_label_shift(data, result, apply=cfg.label_shift)
                 log.info("пропорции классов train → test (EM по %s): сдвиг %.3f, калибровка %.3f, %s; test: %s",
                          result.name, data.label_shift["tv"], data.label_shift["sanity_tv"],
-                         "учитываем" if data.label_shift["used"] else "не учитываем", data.label_shift["test"])
+                         "учитываем" if data.label_shift["used"] else "только диагностика", data.label_shift["test"])
             except Exception as error:  # noqa: BLE001
                 data.label_shift = {"used": False, "error": str(error)[:200]}
         consider(f"fallback_{result.name}", result.oof, result.test_pred, result.fold_scores,
@@ -774,7 +777,10 @@ def run(spec: Any, deadline: Any = None, config: FallbackConfig | None = None) -
             return None
         if left() - tail < 5:
             return None
-        stop_at = time.monotonic() + (left() - tail) * share
+        window = (left() - tail) * share
+        if unit is not None:
+            window = min(window, cfg.job_cap_units * unit)
+        stop_at = time.monotonic() + window
         try:
             result = cv_model(data, name, model, cfg, stop_at, transform=tf, extra=extra, threads=threads,
                               exclude=exclude)
