@@ -125,7 +125,7 @@ print(response.choices[0].message.content)
 |---|------|------------------|-------|
 | P1 | Тимлид, оркестрация, оценочный харнесс, тюнинг и ансамбль | `solution.py`, `schemas.py`, `budget.py`, `evaluator.py` (честный харнесс оценки), `eda.py` (профиль данных), `tuning.py` (optuna), `ensemble.py`, `package.py`, `requirements.txt` | `feature/skeleton-contracts`, `feature/time-budget`, `feature/evaluator-harness`, `feature/eda-profile`, `feature/tuning`, `feature/final-ensemble`, `feature/packaging` |
 | P2 | LLM-инфраструктура и понимание задачи | `llm_client.py`, `task_understanding.py`, `prompts_task.py` | `feature/llm-client`, `feature/task-understanding` |
-| P3 | ML-ядро: fallback, предобработка, метрики | `fallback.py`, `preprocess.py`, `metrics.py`, `submission.py` | `feature/fallback-pipeline`, `feature/metrics-submission`, `feature/preprocess-v2` |
+| P3 — **@holdhype** | ML-ядро: fallback, предобработка, метрики | `fallback.py`, `preprocess.py`, `metrics.py`, `submission.py` | `feature/fallback-pipeline`, `feature/metrics-submission`, `feature/preprocess-v2` |
 | P4 — **@egrsid** | AutoResearch-агент (LLM-управляемый цикл) | `agent.py`, `prompts_agent.py`, `memory.py` (память экспериментов) | `feature/agent-loop`, `feature/experiment-memory`, `feature/agent-strategies` |
 | P5 | Песочница, защита, тесты универсальности | `sandbox.py`, `guards.py`, `tests/` (вне ZIP), `make_datasets.py` (вне ZIP, в `tools/`) | `feature/sandbox`, `feature/guards-validation`, `feature/test-datasets`, `feature/docker-check` |
 
@@ -145,7 +145,7 @@ print(response.choices[0].message.content)
 - `task_understanding.py`: `understand_task(task_dir, llm|None) -> TaskSpec`. Сначала детерминированные эвристики (id-колонка и target из `sample_submission.csv`, тип по таргету, метрика по regex из `task.md`), затем LLM уточняет (метрика, тип, замечания по признакам из `data_dictionary.csv`, колонки-утечки, id-подобные, даты, текст). Ответ LLM валидируется и сверяется с реальными колонками; при расхождении — эвристики. Должен работать, когда нет `data_dictionary.csv` или формат колонок другой (сейчас у двух задач разные наборы колонок словаря).
 - Поддержать нестандартное: бинарная классификация (нужны вероятности для AUC/logloss?), мультилейбл, несколько таргетов в `sample_submission.csv`, таргет-строки, метрики RMSE/MAE/RMSLE/MAPE/R²/F1(macro/micro/weighted)/accuracy/AUC/logloss.
 
-**P3 — ML-ядро (страховка)**
+**P3 — ML-ядро, страховка (владелец: @holdhype)**
 - `fallback.py` + `preprocess.py`: перенос и развитие текущего `solution.py` (v0, LightGBM без CV). Авто-предобработка: пропуски, категории (в т.ч. высокая кардинальность), даты, строки, константные и id-подобные колонки, дубликаты; K-fold CV (stratified для классификации); LightGBM + CatBoost (+XGBoost по времени); для классификации — class_weight/пороги под Macro F1; для регрессии — опционально лог-таргет, выбирается по CV. Пишет `submission.csv` СРАЗУ после первой модели и перезаписывает только при улучшении CV. Должен укладываться в ~15 мин на 8 CPU и в память 32 ГБ.
 - `metrics.py`: реестр метрик (имя → функция, направление, нужны ли вероятности), единый `score(metric, y_true, y_pred)`. Именно им считают CV и fallback, и агент.
 - `submission.py`: сверка с `sample_submission.csv` (колонки, порядок, число строк, множество id, допустимые классы, NaN) и запись. Это единственная точка записи `submission.csv`.
