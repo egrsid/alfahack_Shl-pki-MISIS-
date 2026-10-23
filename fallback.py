@@ -300,10 +300,14 @@ def _lr(n: int) -> float:
 
 
 def model_threads(model: str, n_rows: int, threads: int) -> int:
-    """LightGBM/XGBoost на небольших данных медленнее с большим числом потоков (3000 строк: 1 поток — 1 с, 15 — 25 с)."""
+    """Потоки модели. LightGBM/XGBoost — не больше физических ядер (≈ половина vCPU) и «строк / 10 000».
+
+    Замеры (Mac, fallback-LightGBM, одинаковый CV): 3 000 строк — 1 поток 1 с, 15 потоков 25 с;
+    87 670 строк × 10 классов — 2/4/8 потоков: 184/152/202 с; 53 308 строк — 13/11/16 с. CatBoost масштабируется хорошо.
+    """
     if model == "catboost":
         return threads
-    return max(1, min(threads, n_rows // ROWS_PER_THREAD))
+    return max(1, min(max(1, threads // 2), n_rows // ROWS_PER_THREAD))
 
 
 ROWS_PER_THREAD = 10_000

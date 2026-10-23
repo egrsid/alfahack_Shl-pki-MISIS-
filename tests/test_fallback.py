@@ -166,6 +166,7 @@ def test_multi_target_regression(tmp_path):
 def test_n_threads_is_positive():
     assert F.n_threads() >= 1
     assert F.model_threads("lightgbm", 3_000, 8) == 1 and F.model_threads("catboost", 3_000, 8) == 8
+    assert F.model_threads("xgboost", 87_670, 8) == 4 and F.model_threads("lightgbm", 53_308, 8) == 4
 
 
 @pytest.mark.parametrize("budget_left, expected", [(1000.0, 900.0), (100.0, 80.0), (5.0, 20.0)])
