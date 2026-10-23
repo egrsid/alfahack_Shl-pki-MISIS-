@@ -28,7 +28,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import KFold, StratifiedKFold
+from sklearn.model_selection import GroupKFold, KFold, StratifiedGroupKFold, StratifiedKFold
 
 import metrics
 import preprocess
@@ -73,7 +73,8 @@ class FallbackConfig:
     time_budget: float = 900.0       # потолок на весь fallback, с (план: fallback ≤ T+15 мин)
     reserve: float = 20.0            # не трогаем последние N секунд дедлайна
     n_splits: int = 5
-    seed: int = 42                   # тот же сид, что у заглушки evaluator P4: сплиты совпадают
+    seed: int = 42                   # тот же сид, что у заглушки evaluator P4: при cv="random" сплиты совпадают
+    cv: str = "auto"                 # auto — схема по данным (период / дубли / случайная), random — всегда (Stratified)KFold
     models: tuple[str, ...] = ("lightgbm", "catboost", "xgboost")
     max_rounds: int = 5000
     early_stopping: int = 100
@@ -81,6 +82,7 @@ class FallbackConfig:
     try_balanced: bool = True        # LightGBM с class_weight=balanced для F1-подобных метрик при дисбалансе
     blend: bool = True
     decision: bool = True            # порог / веса классов для F1-подобных метрик
+    label_shift: bool = True         # учитывать сдвиг пропорций классов train → test (EM), если он надёжно найден
     decision_seconds: float = 40.0
     write: bool = True
     threads: int | None = None
@@ -89,7 +91,13 @@ class FallbackConfig:
 # ---------------------------------------------------------------- окружение
 
 def n_threads() -> int:
-    """Доступные ядра с учётом affinity и квоты cgroup (в Docker os.cpu_count() видит все ядра хоста)."""
+    """Доступные ядра с учётом affinity и квоты cgroup (в Docker os.cpu_count() видит все ядра хоста).
+
+    FALLBACK_THREADS=<n> в окружении задаёт число вручную (перекалибровка без правки кода).
+    """
+    forced = os.environ.get("FALLBACK_THREADS", "")
+    if forced.isdigit() and int(forced) > 0:
+        return int(forced)
     n = os.cpu_count() or 1
     try:
         n = len(os.sched_getaffinity(0))
@@ -215,6 +223,10 @@ class TaskData:
     prep: preprocess.Prepared
     folds: np.ndarray
     n_splits: int
+    cv_scheme: dict = field(default_factory=dict)  # kind: random | period | duplicates (+ подробности)
+    period_feature: str | None = None              # имя колонки-периода в prep.X (кандидат на исключение)
+    label_shift: dict | None = None                # оценка пропорций классов в test (detect_label_shift)
+    shift_weights: np.ndarray | None = None        # π_test(y)/π_train(y) для строк train, если сдвиг применяется
     frames: dict[str, tuple[pd.DataFrame, pd.DataFrame, list[str]]] = field(default_factory=dict)
 
     def frame(self, model: str) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
@@ -226,18 +238,83 @@ class TaskData:
         return self.frames[key]
 
 
-def make_folds(y: np.ndarray, task: str, n_splits: int, seed: int) -> np.ndarray:
-    """Номер фолда для каждой строки: StratifiedKFold для классификации, KFold для регрессии (shuffle, seed)."""
+def make_folds(y: np.ndarray, task: str, n_splits: int, seed: int, groups: np.ndarray | None = None) -> np.ndarray:
+    """Номер фолда для каждой строки: (Stratified)KFold, а при groups — (Stratified)GroupKFold (группа целиком в одном фолде)."""
     folds = np.zeros(len(y), dtype=np.int64)
-    if task != "regression" and np.bincount(y).max() >= n_splits:
+    stratify = task != "regression" and np.bincount(y).max() >= n_splits
+    if groups is not None:
+        splitter = StratifiedGroupKFold(n_splits, shuffle=True, random_state=seed) if stratify else GroupKFold(n_splits)
+    elif stratify:
         splitter = StratifiedKFold(n_splits, shuffle=True, random_state=seed)
     else:
         splitter = KFold(n_splits, shuffle=True, random_state=seed)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # «least populated class has only N members» — ожидаемо для редких классов
-        for i, (_, valid) in enumerate(splitter.split(np.zeros(len(y)), y)):
+        for i, (_, valid) in enumerate(splitter.split(np.zeros(len(y)), y, groups)):
             folds[valid] = i
     return folds
+
+
+def find_period_column(train_x: pd.DataFrame, test_x: pd.DataFrame, max_levels: int = 50) -> str | None:
+    """Колонка-«период»: целые коды, в test только значения, которых нет в train, и все по одну сторону от них.
+
+    Пример — Year_Factor: train 1..5, test 6. Тогда test — «новый период», и честная валидация — по периодам.
+    """
+    found = []
+    for col in train_x.columns:
+        a, b = train_x[col], test_x[col]
+        if pd.api.types.is_bool_dtype(a) or not (pd.api.types.is_numeric_dtype(a) and pd.api.types.is_numeric_dtype(b)):
+            continue
+        ua, ub = np.unique(a.dropna()), np.unique(b.dropna())
+        if not (3 <= len(ua) <= max_levels and 1 <= len(ub) <= max_levels) or np.intersect1d(ua, ub).size:
+            continue
+        if not np.allclose(np.r_[ua, ub], np.round(np.r_[ua, ub])):
+            continue
+        if ub.min() > ua.max() or ub.max() < ua.min():
+            found.append((len(ua), col))
+    return max(found)[1] if found else None  # больше уровней в train — больше фолдов
+
+
+def duplicate_stats(train_x: pd.DataFrame, test_x: pd.DataFrame) -> tuple[np.ndarray, float, float]:
+    """(группа одинаковых строк train, доля строк train с дублем в train, доля строк test с точным близнецом в train)."""
+    h_train = pd.util.hash_pandas_object(train_x, index=False).to_numpy()
+    h_test = pd.util.hash_pandas_object(test_x, index=False).to_numpy()
+    groups = pd.factorize(h_train)[0]
+    dup_share = float(pd.Series(h_train).duplicated(keep=False).mean()) if len(h_train) else 0.0
+    twin_share = float(np.isin(h_test, h_train).mean()) if len(h_test) else 0.0
+    return groups, dup_share, twin_share
+
+
+def choose_cv(train_x: pd.DataFrame, test_x: pd.DataFrame, y: np.ndarray, task: str, n_splits: int,
+              seed: int, prep: preprocess.Prepared) -> tuple[np.ndarray, int, dict, str | None]:
+    """Схема CV, похожая на то, как устроен test относительно train.
+
+    period     — в test новый период (колонка-код вне диапазона train или дата позже train) → фолды по периодам;
+    duplicates — в train много одинаковых строк, а в test близнецов из train заметно меньше → одинаковые строки
+                 в одном фолде (иначе CV меряет запоминание дублей, которого на test не будет);
+    random     — иначе (Stratified)KFold.
+    """
+    period = find_period_column(train_x, test_x)
+    period_feature = None
+    if period is not None:
+        groups = pd.factorize(train_x[period])[0]
+        renamed = {old: new for new, old in prep.report.get("renamed", {}).items()}
+        period_feature = renamed.get(period, period) if renamed.get(period, period) in prep.X.columns else None
+        k = min(n_splits, int(groups.max()) + 1)
+        info = {"kind": "period", "column": period, "train_levels": int(groups.max()) + 1,
+                "test_levels": sorted(np.unique(test_x[period].dropna()).tolist())[:10]}
+        return make_folds(y, task, k, seed, groups), k, info, period_feature
+    for col in [c for c in prep.X.columns if c.endswith("__ts")]:  # дата: test целиком позже train
+        a, b = prep.X[col], prep.X_test[col]
+        if a.notna().mean() > 0.9 and b.notna().any() and b.min() > a.max():
+            groups = pd.qcut(a.rank(method="first"), n_splits, labels=False).fillna(0).astype(int).to_numpy()
+            info = {"kind": "period", "column": col, "train_levels": n_splits, "test_levels": ["after train"]}
+            return make_folds(y, task, n_splits, seed, groups), n_splits, info, None
+    groups, dup_share, twin_share = duplicate_stats(train_x, test_x)
+    info = {"dup_share": round(dup_share, 4), "twin_share": round(twin_share, 4)}
+    if dup_share >= 0.05 and twin_share < 0.5 * dup_share:
+        return make_folds(y, task, n_splits, seed, groups), n_splits, {"kind": "duplicates", **info}, None
+    return make_folds(y, task, n_splits, seed), n_splits, {"kind": "random", **info}, None
 
 
 def _resolve_task(spec: Any, y_raw: pd.Series) -> tuple[str, str]:
@@ -289,8 +366,13 @@ def load(spec: Any, cfg: FallbackConfig) -> TaskData:
     features = [c for c in test.columns if c in train.columns and c not in drop]
     prep = preprocess.prepare(train[features], test[features], spec)
     n_splits = max(2, min(cfg.n_splits, len(y) // 20 if len(y) >= 40 else 2))
-    folds = make_folds(y, task, n_splits, cfg.seed)
-    return TaskData(spec, task, metric, y, classes, prep, folds, n_splits)
+    if cfg.cv == "auto":
+        folds, n_splits, scheme, period_feature = choose_cv(train[features], test[features], y, task, n_splits,
+                                                            cfg.seed, prep)
+    else:
+        folds, scheme, period_feature = make_folds(y, task, n_splits, cfg.seed), {"kind": "random"}, None
+    log.info("схема CV: %s", scheme)
+    return TaskData(spec, task, metric, y, classes, prep, folds, n_splits, scheme, period_feature)
 
 
 # ---------------------------------------------------------------- модели
@@ -326,9 +408,12 @@ def _params(model: str, data: TaskData, cfg: FallbackConfig, threads: int, extra
         if regression:
             params["objective"] = "regression_l1" if l1 else "regression"
     elif model == "catboost":
+        # ускорение без потери качества (public-мультикласс, фолд, 300 итераций): 69.6 → 18.1 с, logloss 0.4786 → 0.4751
         params = dict(iterations=cfg.max_rounds, learning_rate=min(0.15, _lr(n) * 1.6), depth=6,
                       random_seed=cfg.seed, thread_count=threads, verbose=0, allow_writing_files=False,
-                      od_type="Iter", od_wait=cfg.early_stopping, use_best_model=True)
+                      od_type="Iter", od_wait=cfg.early_stopping, use_best_model=True,
+                      border_count=128, max_ctr_complexity=1, bootstrap_type="Bernoulli", subsample=0.8,
+                      one_hot_max_size=16)
         if regression:
             params["loss_function"] = "MAE" if l1 else "RMSE"
     else:
@@ -418,6 +503,7 @@ class Run:
     params: dict
     transform: str | None
     iterations: list[int]
+    exclude: tuple[str, ...] = ()
 
     @property
     def cv(self) -> float:
@@ -425,11 +511,15 @@ class Run:
 
 
 def cv_model(data: TaskData, name: str, model: str, cfg: FallbackConfig, stop_at: float, *,
-             transform: str | None = None, extra: dict | None = None, threads: int = 1) -> Run:
+             transform: str | None = None, extra: dict | None = None, threads: int = 1,
+             exclude: tuple[str, ...] = ()) -> Run:
     """K-fold с фиксированными фолдами: OOF, среднее по фолдам на test, оценка metrics.score на каждом фолде."""
     start = time.monotonic()
     regression = data.task == "regression"
     x, x_test, cats = data.frame(model)
+    if exclude:
+        x, x_test = x.drop(columns=list(exclude), errors="ignore"), x_test.drop(columns=list(exclude), errors="ignore")
+        cats = [c for c in cats if c not in exclude]
     params = _params(model, data, cfg, threads, extra or {})
     k = len(data.classes or [])
     oof = np.zeros(len(x)) if regression else np.zeros((len(x), k))
@@ -460,7 +550,8 @@ def cv_model(data: TaskData, name: str, model: str, cfg: FallbackConfig, stop_at
         test_pred += fold_test / data.n_splits
         scores.append(metrics.score(data.metric, data.y[valid_idx], oof[valid_idx]))
         iterations.append(iters)
-    return Run(name, model, oof, test_pred, scores, time.monotonic() - start, params, transform, iterations)
+    return Run(name, model, oof, test_pred, scores, time.monotonic() - start, params, transform, iterations,
+               tuple(exclude))
 
 
 # ---------------------------------------------------------------- бленд и кандидаты
@@ -470,19 +561,24 @@ def _fold_scores(data: TaskData, oof: np.ndarray) -> list[float]:
 
 
 def blend(data: TaskData, runs: list[Run], max_steps: int = 30) -> tuple[np.ndarray, np.ndarray, dict] | None:
-    """Жадный отбор с возвращением (Caruana) по OOF; None — если бленд не лучше лучшей одиночной модели."""
+    """Жадный отбор с возвращением (Caruana) по OOF; None — если отбор оставил одну модель.
+
+    Для классификации отбор идёт по logloss: argmax-метрики (F1, accuracy) ступенчатые и плохо ведут жадный поиск;
+    итоговое сравнение с одиночными моделями — по метрике задачи с порогом/весами классов (consider в run).
+    """
     if len(runs) < 2:
         return None
+    select = data.metric if data.task == "regression" else "logloss"
     counts = np.zeros(len(runs))
     current, best = None, None
     for step in range(max_steps):
         choice, choice_score = None, None
         for i, run in enumerate(runs):
             trial = run.oof if current is None else (current * step + run.oof) / (step + 1)
-            value = metrics.score(data.metric, data.y, trial)
-            if choice_score is None or metrics.is_better(data.metric, value, choice_score):
+            value = metrics.score(select, data.y, trial)
+            if choice_score is None or metrics.is_better(select, value, choice_score):
                 choice, choice_score = i, value
-        if best is not None and not metrics.is_better(data.metric, choice_score, best):
+        if best is not None and not metrics.is_better(select, choice_score, best):
             break
         counts[choice] += 1
         current = runs[choice].oof if current is None else (current * step + runs[choice].oof) / (step + 1)
@@ -495,23 +591,64 @@ def blend(data: TaskData, runs: list[Run], max_steps: int = 30) -> tuple[np.ndar
     return oof, test_pred, {r.name: round(float(w), 4) for w, r in zip(weights, runs) if w > 0}
 
 
+def detect_label_shift(data: TaskData, run: Run, min_tv: float = 0.03, max_sanity_tv: float = 0.02) -> dict:
+    """Пропорции классов в test по калиброванной модели (EM). used=True — сдвиг заметный и оценке можно верить.
+
+    Проверка калибровки: EM по OOF той же модели должен вернуть пропорции train (sanity_tv мал).
+    """
+    k = len(data.classes or [])
+    train = np.bincount(data.y, minlength=k) / len(data.y)
+    sanity = metrics.estimate_priors(run.oof, train)
+    test = metrics.estimate_priors(run.test_pred, train)
+    tv, sanity_tv = 0.5 * float(np.abs(test - train).sum()), 0.5 * float(np.abs(sanity - train).sum())
+    info = {"train": dict(zip(data.classes, np.round(train, 4).tolist())),
+            "test": dict(zip(data.classes, np.round(test, 4).tolist())),
+            "tv": round(tv, 4), "sanity_tv": round(sanity_tv, 4), "model": run.name,
+            "used": bool(tv >= min_tv and sanity_tv <= max_sanity_tv)}
+    if info["used"]:
+        data.shift_weights = (test / np.clip(train, 1e-12, None))[data.y]
+    return info
+
+
 def make_candidate(data: TaskData, name: str, oof: np.ndarray, test_pred: np.ndarray, fold_scores: list[float],
                    meta: dict, cfg: FallbackConfig, decision_seconds: float) -> Candidate:
     meta = dict(meta, fold_scores=[float(s) for s in fold_scores], folds=data.folds, n_splits=data.n_splits,
+                cv_scheme=data.cv_scheme,
                 seed=cfg.seed, classes=data.classes, metric=data.metric, decision=None,
                 cv_score_post=float(np.mean(fold_scores)))
-    if cfg.decision and data.task != "regression" and metrics.get(data.metric).tunable and decision_seconds > 1:
+    tunable = data.task != "regression" and metrics.get(data.metric).tunable
+    w = data.shift_weights if tunable else None
+    if w is not None:  # всё «пост»-качество — при пропорциях классов test, чтобы кандидаты сравнивались одинаково
+        weighted = metrics._fast_label_metric(data.metric, len(data.classes))
+        base = [weighted(data.y[data.folds == f], oof[data.folds == f].argmax(axis=1), w[data.folds == f])
+                for f in range(data.n_splits)]
+        meta.update(cv_score_post=float(np.mean(base)), label_shift=data.label_shift)
+    else:
+        base = fold_scores
+    meta["fold_scores_eff"] = [float(v) for v in base]  # по фолдам — то, что сравнивается (с decision — ниже)
+    if cfg.decision and tunable and decision_seconds > 1:
         try:
             post_scores, decision = metrics.crossfit_decision(data.metric, data.y, oof, data.folds,
-                                                              time_limit=decision_seconds)
+                                                              time_limit=decision_seconds, sample_weight=w)
             if decision is not None and metrics.is_better(data.metric, float(np.mean(post_scores)),
-                                                          float(np.mean(fold_scores))):
+                                                          float(np.mean(base))):
                 meta.update(decision=decision, cv_score_post=float(np.mean(post_scores)),
-                            fold_scores_post=[float(s) for s in post_scores])
+                            fold_scores_post=[float(s) for s in post_scores],
+                            fold_scores_eff=[float(s) for s in post_scores])
         except Exception as error:  # noqa: BLE001
             log.warning("порог/веса классов не подобраны: %s", error)
     return Candidate(name=name, cv_score=float(np.mean(fold_scores)), cv_std=float(np.std(fold_scores)),
                      oof=oof, test_pred=test_pred, meta=meta)
+
+
+def clearly_better(metric: str, new: Candidate, old: Candidate, k: float = 1.0) -> bool:
+    """Выигрыш по фолдам больше k стандартных ошибок парных разностей (как правило принятия у агента P4)."""
+    a = np.asarray(new.meta.get("fold_scores_eff", new.meta.get("fold_scores", [])), dtype=float)
+    b = np.asarray(old.meta.get("fold_scores_eff", old.meta.get("fold_scores", [])), dtype=float)
+    if len(a) != len(b) or len(a) < 2:
+        return metrics.is_better(metric, effective_cv(new), effective_cv(old))
+    diff = (a - b) * (1.0 if metrics.greater_is_better(metric) else -1.0)
+    return bool(diff.mean() > k * diff.std(ddof=1) / np.sqrt(len(diff)))
 
 
 def effective_cv(cand: Candidate) -> float:
@@ -592,26 +729,45 @@ def run(spec: Any, deadline: Any = None, config: FallbackConfig | None = None) -
     runs: list[Run] = []
     best: Candidate | None = None
     transform: str | None = None
+    excluded: tuple[str, ...] = ()  # признаки, исключённые по CV (колонка-период)
     unit: float | None = None  # секунд на «единицу» LightGBM — для оценки остальных моделей
 
     def left() -> float:
         return end - time.monotonic()
 
-    def consider(name: str, oof: np.ndarray, test_pred: np.ndarray, scores: list[float], meta: dict) -> None:
-        """Лучший — по качеству того, что уйдёт в файл (CV с порогом/весами классов); он же пишется на диск."""
+    def consider(name: str, oof: np.ndarray, test_pred: np.ndarray, scores: list[float], meta: dict,
+                 strict: bool = False) -> None:
+        """Лучший — по качеству того, что уйдёт в файл (CV с порогом/весами классов); он же пишется на диск.
+
+        strict — для бленда: его веса подобраны на тех же OOF, поэтому нужен выигрыш больше шума по фолдам.
+        """
         nonlocal best
         cand = make_candidate(data, name, oof, test_pred, scores, meta, cfg, min(decision_seconds, left() / 4))
+        if strict and best is not None and not clearly_better(data.metric, cand, best):
+            log.info("%s: cv=%.6g не лучше %s с запасом больше шума — не берём", name, effective_cv(cand), best.name)
+            return
         if best is None or metrics.is_better(data.metric, effective_cv(cand), effective_cv(best)):
             best = cand
             writer.offer(best)
 
     def accept(result: Run) -> None:
         runs.append(result)
+        if (data.task != "regression" and data.label_shift is None and cfg.label_shift
+                and result.params.get("class_weight") is None):
+            try:
+                data.label_shift = detect_label_shift(data, result)
+                log.info("пропорции классов train → test (EM по %s): сдвиг %.3f, калибровка %.3f, %s; test: %s",
+                         result.name, data.label_shift["tv"], data.label_shift["sanity_tv"],
+                         "учитываем" if data.label_shift["used"] else "не учитываем", data.label_shift["test"])
+            except Exception as error:  # noqa: BLE001
+                data.label_shift = {"used": False, "error": str(error)[:200]}
         consider(f"fallback_{result.name}", result.oof, result.test_pred, result.fold_scores,
                  {"model": result.model, "params": result.params, "target_transform": result.transform,
-                  "iterations": result.iterations, "seconds": round(result.seconds, 1)})
+                  "excluded": list(result.exclude), "iterations": result.iterations,
+                  "seconds": round(result.seconds, 1)})
 
-    def attempt(name: str, model: str, extra: dict, tf: str | None, share: float) -> Run | None:
+    def attempt(name: str, model: str, extra: dict, tf: str | None, share: float,
+                exclude: tuple[str, ...] = ()) -> Run | None:
         tail = 15.0 + decision_seconds
         if unit is not None and unit * _COST.get(model, 1.0) > 1.5 * max(0.0, left() - tail):
             log.info("%s пропущен: оценка %.0f с, осталось %.0f с", name, unit * _COST.get(model, 1.0), left())
@@ -620,7 +776,8 @@ def run(spec: Any, deadline: Any = None, config: FallbackConfig | None = None) -
             return None
         stop_at = time.monotonic() + (left() - tail) * share
         try:
-            result = cv_model(data, name, model, cfg, stop_at, transform=tf, extra=extra, threads=threads)
+            result = cv_model(data, name, model, cfg, stop_at, transform=tf, extra=extra, threads=threads,
+                              exclude=exclude)
         except Exception as error:  # noqa: BLE001 — сбой одной модели не роняет остальные
             log.warning("%s упал: %s: %s", name, type(error).__name__, str(error)[:300])
             return None
@@ -631,15 +788,23 @@ def run(spec: Any, deadline: Any = None, config: FallbackConfig | None = None) -
     jobs = _plan(data, cfg)
     for i, (name, model, extra) in enumerate(jobs):
         last = i == len(jobs) - 1
-        result = attempt(name, model, extra, transform, 1.0 if last else 0.5)
+        result = attempt(name, model, extra, transform, 1.0 if last else 0.5, excluded)
         if result is None:
             continue
         unit = unit or result.seconds
         accept(result)  # сабмит пишется сразу после первой модели
+        if model == "lightgbm" and not extra and data.period_feature and not excluded:
+            # test — новый период, которого модель не видела: проверяем по CV, не мешает ли сам код периода
+            without = attempt("lightgbm_noperiod", "lightgbm", {}, transform, 0.5, (data.period_feature,))
+            if without is not None:
+                accept(without)
+                if metrics.is_better(data.metric, without.cv, result.cv):
+                    excluded, result = (data.period_feature,), without
+                    log.info("без %s лучше по CV — остальные модели учатся без него", data.period_feature)
         if (model == "lightgbm" and not extra and data.task == "regression" and transform is None
                 and cfg.try_log_target and data.y.min() >= 0
                 and (data.metric in ("rmsle", "msle", "mape") or pd.Series(data.y).skew() > 0.75)):
-            logged = attempt("lightgbm_log", "lightgbm", {}, "log1p", 0.5)
+            logged = attempt("lightgbm_log", "lightgbm", {}, "log1p", 0.5, excluded)
             if logged is not None:
                 accept(logged)
                 if metrics.is_better(data.metric, logged.cv, result.cv):
@@ -654,7 +819,8 @@ def run(spec: Any, deadline: Any = None, config: FallbackConfig | None = None) -
                 scores = _fold_scores(data, oof)
                 log.info("бленд %s: cv=%.6g", weights, float(np.mean(scores)))
                 consider("fallback_blend", oof, test_pred, scores,
-                         {"model": "blend", "members": weights, "params": {}, "target_transform": transform})
+                         {"model": "blend", "members": weights, "params": {}, "target_transform": transform,
+                          "excluded": list(excluded)}, strict=True)
         except Exception as error:  # noqa: BLE001
             log.warning("бленд упал: %s", error)
 
@@ -663,6 +829,7 @@ def run(spec: Any, deadline: Any = None, config: FallbackConfig | None = None) -
         best = _constant_candidate(data, cfg)
         writer.offer(best)
     best.meta.update(seconds=round(time.monotonic() - start, 1), preprocess=data.prep.report,
+                     label_shift=data.label_shift,
                      runs=[{"name": r.name, "cv": r.cv, "std": float(np.std(r.fold_scores)),
                             "seconds": round(r.seconds, 1)} for r in runs])
     log.info("fallback готов за %.0f с: %s cv=%.6g (с порогом/весами: %.6g)", time.monotonic() - start, best.name,

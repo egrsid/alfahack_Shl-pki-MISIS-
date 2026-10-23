@@ -175,3 +175,75 @@ def test_budget_from_deadline(budget_left, expected):
         def left(self):
             return budget_left
     assert F._budget(Deadline(), F.FallbackConfig()) == pytest.approx(expected)
+
+
+def test_period_column_detection():
+    train = pd.DataFrame({"year": [1, 2, 3, 4, 5] * 20, "x": np.arange(100.0), "code": [1, 2, 3, 4, 5] * 20})
+    test = pd.DataFrame({"year": [6] * 10, "x": np.arange(10.0), "code": [3] * 10})
+    assert F.find_period_column(train, test) == "year"
+    assert F.find_period_column(train[["code"]], test[["code"]]) is None  # значения test встречаются в train
+    assert F.find_period_column(train[["x"]], test[["x"]] + 1000) is None  # непрерывная колонка — не период
+
+
+def test_period_cv_groups_whole_years(tmp_path):
+    rng = np.random.default_rng(0)
+    n = 500
+    df = pd.DataFrame({"id": range(n), "year": rng.integers(1, 6, n), "x": rng.normal(size=n)})
+    df["y"] = df.x * 2 + df.year + rng.normal(scale=.1, size=n)
+    test = pd.DataFrame({"id": range(n, n + 100), "year": 6, "x": rng.normal(size=100)})
+    write_task(tmp_path, df, test, pd.DataFrame({"id": test.id, "y": 0.0}))
+    spec = Spec(tmp_path, "id", "y", "regression", "rmse")
+    data = F.load(spec, _cfg())
+    assert data.cv_scheme["kind"] == "period" and data.cv_scheme["column"] == "year"
+    for f in range(data.n_splits):
+        assert df.year[data.folds == f].nunique() == 1  # каждый фолд — целый год
+    cand = F.run(spec, config=_cfg())
+    assert "lightgbm_noperiod" in {r["name"] for r in cand.meta["runs"]} and cand.meta["cv_scheme"]["kind"] == "period"
+
+
+def test_duplicate_aware_cv(tmp_path):
+    rng = np.random.default_rng(1)
+    base = pd.DataFrame({"x": rng.integers(0, 30, 300), "z": rng.integers(0, 3, 300)})
+    train = pd.concat([base] * 3, ignore_index=True)  # каждая строка трижды
+    train["label"] = np.where(train.x > 15, "a", "b")
+    train.insert(0, "id", range(len(train)))
+    test = pd.DataFrame({"id": range(900, 1000), "x": rng.integers(100, 200, 100), "z": 1})  # близнецов в train нет
+    write_task(tmp_path, train, test, pd.DataFrame({"id": test.id, "label": "a"}))
+    data = F.load(Spec(tmp_path, "id", "label", "binary", "accuracy"), _cfg())
+    assert data.cv_scheme["kind"] == "duplicates" and data.cv_scheme["twin_share"] == 0
+    feats = train[["x", "z"]].astype(str).agg("|".join, axis=1)
+    assert (pd.Series(data.folds).groupby(feats.to_numpy()).nunique() == 1).all()  # одинаковые строки в одном фолде
+    test2 = train.iloc[:100].drop(columns="label")  # test из тех же строк — схема обычная
+    write_task(tmp_path, train, test2, pd.DataFrame({"id": test2.id, "label": "a"}))
+    assert F.load(Spec(tmp_path, "id", "label", "binary", "accuracy"), _cfg()).cv_scheme["kind"] == "random"
+
+
+def test_label_shift_detected_and_used(tmp_path):
+    rng = np.random.default_rng(2)
+
+    def frame(n, prior):
+        y = rng.choice(3, n, p=prior)
+        return pd.DataFrame({"x1": rng.normal(size=n) + 1.5 * (y == 1), "x2": rng.normal(size=n) + 1.5 * (y == 2),
+                             "label": np.array(["a", "b", "c"])[y]})
+    train, test = frame(4000, [0.7, 0.2, 0.1]), frame(2000, [0.3, 0.3, 0.4])
+    train.insert(0, "id", range(4000))
+    test = test.drop(columns="label")
+    test.insert(0, "id", range(4000, 6000))
+    write_task(tmp_path, train, test, pd.DataFrame({"id": test.id, "label": "a"}))
+    cand = F.run(Spec(tmp_path, "id", "label", "multiclass", "macro_f1", True), config=_cfg())
+    shift = cand.meta["label_shift"]
+    assert shift["used"] and shift["tv"] > 0.2 and abs(shift["test"]["c"] - 0.4) < 0.08
+    assert submission.check_file(Spec(tmp_path, "id", "label", "multiclass", "macro_f1", True)) == []
+
+
+def test_no_label_shift_when_same_distribution(tmp_path):
+    spec, _ = classification_task(tmp_path, n_train=2000, n_test=1000, n_classes=3)
+    cand = F.run(spec, config=_cfg())
+    assert cand.meta["label_shift"]["used"] is False
+
+
+def test_threads_from_environment(monkeypatch):
+    monkeypatch.setenv("FALLBACK_THREADS", "3")
+    assert F.n_threads() == 3
+    monkeypatch.setenv("FALLBACK_THREADS", "zero")
+    assert F.n_threads() >= 1
