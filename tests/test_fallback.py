@@ -250,3 +250,15 @@ def test_threads_from_environment(monkeypatch):
     assert F.n_threads() == 3
     monkeypatch.setenv("FALLBACK_THREADS", "zero")
     assert F.n_threads() >= 1
+
+
+def test_cv_folds_match_run_and_skip_rows_without_target(tmp_path):
+    spec, _ = regression_task(tmp_path)
+    train = pd.read_csv(tmp_path / "train.csv")
+    train.loc[[3, 7], "target"] = np.nan  # строки без таргета fallback выбрасывает — evaluator должен знать какие
+    train.to_csv(tmp_path / "train.csv", index=False)
+    folds, rows, scheme = F.cv_folds(spec, _cfg())
+    cand = F.run(spec, config=_cfg())
+    assert np.array_equal(folds, cand.meta["folds"]) and scheme["kind"] == cand.meta["cv_scheme"]["kind"]
+    assert len(rows) == len(folds) == 598 and 3 not in rows and 7 not in rows
+    assert np.array_equal(cand.meta["train_rows"], rows) and scheme["n_splits"] == 5

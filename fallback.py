@@ -231,6 +231,7 @@ class TaskData:
     period_feature: str | None = None              # имя колонки-периода в prep.X (кандидат на исключение)
     label_shift: dict | None = None                # оценка пропорций классов в test (detect_label_shift)
     shift_weights: np.ndarray | None = None        # π_test(y)/π_train(y) для строк train, если сдвиг применяется
+    rows: np.ndarray | None = None                 # позиции строк train.csv, участвующих в обучении (None — все)
     frames: dict[str, tuple[pd.DataFrame, pd.DataFrame, list[str]]] = field(default_factory=dict)
 
     def frame(self, model: str) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
@@ -376,7 +377,20 @@ def load(spec: Any, cfg: FallbackConfig) -> TaskData:
     else:
         folds, scheme, period_feature = make_folds(y, task, n_splits, cfg.seed), {"kind": "random"}, None
     log.info("схема CV: %s", scheme)
-    return TaskData(spec, task, metric, y, classes, prep, folds, n_splits, scheme, period_feature)
+    rows = None if keep.all() else np.flatnonzero(keep)
+    return TaskData(spec, task, metric, y, classes, prep, folds, n_splits, scheme, period_feature, rows=rows)
+
+
+def cv_folds(spec: Any, config: FallbackConfig | None = None) -> tuple[np.ndarray, np.ndarray | None, dict]:
+    """Фолды ровно как у run() — для evaluator P1 и агента P4, чтобы все кандидаты мерились одной честной схемой.
+
+    Возвращает (folds, rows, scheme): folds[i] — номер фолда i-й используемой строки train; rows — позиции этих строк
+    в train.csv (None — используются все; иначе выброшены строки с пустым/бесконечным таргетом); scheme — описание
+    схемы (kind: period | duplicates | random, n_splits и подробности). Модели не обучаются (чтение + предобработка).
+    То же лежит в Candidate.meta["folds"] / ["train_rows"] / ["cv_scheme"] у кандидата fallback.
+    """
+    data = load(spec, config or FallbackConfig())
+    return data.folds, data.rows, dict(data.cv_scheme, n_splits=data.n_splits)
 
 
 # ---------------------------------------------------------------- модели
@@ -618,7 +632,7 @@ def detect_label_shift(data: TaskData, run: Run, min_tv: float = 0.03, max_sanit
 def make_candidate(data: TaskData, name: str, oof: np.ndarray, test_pred: np.ndarray, fold_scores: list[float],
                    meta: dict, cfg: FallbackConfig, decision_seconds: float) -> Candidate:
     meta = dict(meta, fold_scores=[float(s) for s in fold_scores], folds=data.folds, n_splits=data.n_splits,
-                cv_scheme=data.cv_scheme,
+                cv_scheme=data.cv_scheme, train_rows=data.rows,
                 seed=cfg.seed, classes=data.classes, metric=data.metric, decision=None,
                 cv_score_post=float(np.mean(fold_scores)))
     tunable = data.task != "regression" and metrics.get(data.metric).tunable
