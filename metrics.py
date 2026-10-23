@@ -377,15 +377,18 @@ def score(name: str, y_true: Any, y_pred: Any, decision: dict | None = None) -> 
 
 # ---------------------------------------------------------------- подбор порога / весов классов
 
-def _confusion(y: np.ndarray, p: np.ndarray, k: int) -> np.ndarray:
-    return np.bincount(y * k + p, minlength=k * k).reshape(k, k)
+def _confusion(y: np.ndarray, p: np.ndarray, k: int, w: np.ndarray | None = None) -> np.ndarray:
+    return np.bincount(y * k + p, weights=w, minlength=k * k).reshape(k, k)
 
 
-def _fast_label_metric(name: str, k: int) -> Callable[[np.ndarray, np.ndarray], float]:
-    """Быстрая версия метрики по матрице ошибок (для перебора); семантика как у sklearn."""
+def _fast_label_metric(name: str, k: int) -> Callable[..., float]:
+    """Быстрая версия метрики по матрице ошибок (для перебора); семантика как у sklearn.
+
+    Третий аргумент — веса объектов (для оценки при других пропорциях классов); метрики без быстрой версии их игнорируют.
+    """
     if name in ("macro_f1", "weighted_f1") or (name == "f1" and k > 2):
-        def f1(y: np.ndarray, p: np.ndarray) -> float:
-            cm = _confusion(y, p, k)
+        def f1(y: np.ndarray, p: np.ndarray, w: np.ndarray | None = None) -> float:
+            cm = _confusion(y, p, k, w)
             tp, support, predicted = np.diag(cm), cm.sum(axis=1), cm.sum(axis=0)
             denom = support + predicted
             per_class = np.divide(2 * tp, denom, out=np.zeros(k), where=denom > 0)
@@ -395,47 +398,50 @@ def _fast_label_metric(name: str, k: int) -> Callable[[np.ndarray, np.ndarray], 
             return float(per_class[present].mean()) if present.any() else 0.0
         return f1
     if name == "f1":
-        def f1_binary(y: np.ndarray, p: np.ndarray) -> float:
-            tp = np.sum((y == 1) & (p == 1))
-            denom = np.sum(y == 1) + np.sum(p == 1)
+        def f1_binary(y: np.ndarray, p: np.ndarray, w: np.ndarray | None = None) -> float:
+            w = np.ones(len(y)) if w is None else w
+            tp = np.sum(w * ((y == 1) & (p == 1)))
+            denom = np.sum(w * (y == 1)) + np.sum(w * (p == 1))
             return float(2 * tp / denom) if denom else 0.0
         return f1_binary
     if name == "balanced_accuracy":
-        def bal(y: np.ndarray, p: np.ndarray) -> float:
-            cm = _confusion(y, p, k)
+        def bal(y: np.ndarray, p: np.ndarray, w: np.ndarray | None = None) -> float:
+            cm = _confusion(y, p, k, w)
             support = cm.sum(axis=1)
             present = support > 0
             return float(np.mean(np.diag(cm)[present] / support[present]))
         return bal
     func = REGISTRY[name].func
-    return lambda y, p: float(func(y, p))
+    return lambda y, p, w=None: float(func(y, p))
 
 
 def fit_decision(name: str, y_true: Any, proba: Any, *, time_limit: float = 20.0,
-                 max_rows: int = 300_000, seed: int = 0) -> dict | None:
+                 max_rows: int = 300_000, seed: int = 0, sample_weight: Any = None) -> dict | None:
     """Порог (бинарная) или веса классов (мультикласс) под метрику по меткам; None — если не нужно/не помогло.
 
     Подбирается на переданных OOF-вероятностях; честный выигрыш оценивать по другим фолдам (crossfit_decision).
+    sample_weight — веса объектов, например π_test(y)/π_train(y) при сдвиге пропорций классов (см. estimate_priors).
     """
     metric = get(name)
     if not metric.tunable:
         return None
     p = _proba_matrix(np.asarray(proba, dtype=float))
     y = _true_codes(y_true)
+    w = None if sample_weight is None else np.asarray(sample_weight, dtype=float)
     if len(y) > max_rows:
         idx = np.random.default_rng(seed).choice(len(y), max_rows, replace=False)
-        y, p = y[idx], p[idx]
+        y, p, w = y[idx], p[idx], (None if w is None else w[idx])
     k = p.shape[1]
     fast = _fast_label_metric(metric.name, k)
     sign = 1.0 if metric.greater_is_better else -1.0
-    base = sign * fast(y, np.argmax(p, axis=1))
+    base = sign * fast(y, np.argmax(p, axis=1), w)
     stop_at = time.monotonic() + time_limit
 
     if k == 2:
         candidates = np.unique(np.quantile(p[:, 1], np.linspace(0.005, 0.995, 199)))
         best_t, best = 0.5, base
         for t in candidates:
-            value = sign * fast(y, (p[:, 1] >= t).astype(np.int64))
+            value = sign * fast(y, (p[:, 1] >= t).astype(np.int64), w)
             if value > best + 1e-12:
                 best_t, best = float(t), value
         return {"kind": "threshold", "threshold": best_t} if best > base + 1e-9 else None
@@ -450,7 +456,7 @@ def fit_decision(name: str, y_true: Any, proba: Any, *, time_limit: float = 20.0
             current = weights[c]
             for g in grid:
                 weights[c] = current * g
-                value = sign * fast(y, np.argmax(p * weights, axis=1))
+                value = sign * fast(y, np.argmax(p * weights, axis=1), w)
                 if value > best + 1e-12:
                     best, current, improved = value, weights[c], True
                 weights[c] = current
@@ -460,19 +466,49 @@ def fit_decision(name: str, y_true: Any, proba: Any, *, time_limit: float = 20.0
     return {"kind": "class_weights", "weights": [float(w) for w in weights]} if best > base + 1e-9 else None
 
 
-def crossfit_decision(name: str, y_true: Any, proba: Any, folds: np.ndarray, *,
-                      time_limit: float = 60.0) -> tuple[list[float], dict | None]:
+def crossfit_decision(name: str, y_true: Any, proba: Any, folds: np.ndarray, *, time_limit: float = 60.0,
+                      sample_weight: Any = None) -> tuple[list[float], dict | None]:
     """Честная оценка decision: для фолда f порог/веса подбираются на остальных фолдах OOF.
 
     Возвращает (оценки по фолдам с decision, decision, подобранный на всех OOF — для test).
+    С sample_weight и подбор, и оценка идут с весами (качество при пропорциях классов test).
     """
     y = _true_codes(y_true)
     p = np.asarray(proba, dtype=float)
+    w = None if sample_weight is None else np.asarray(sample_weight, dtype=float)
     fold_ids = np.unique(folds)
     per_fold_limit = time_limit / (len(fold_ids) + 1)
+    k = _proba_matrix(p).shape[1]
+    weighted = _fast_label_metric(get(name).name, k)
     scores = []
     for f in fold_ids:
         inside, outside = folds == f, folds != f
-        decision = fit_decision(name, y[outside], p[outside], time_limit=per_fold_limit)
-        scores.append(score(name, y[inside], p[inside], decision))
-    return scores, fit_decision(name, y, p, time_limit=per_fold_limit)
+        decision = fit_decision(name, y[outside], p[outside], time_limit=per_fold_limit,
+                                sample_weight=None if w is None else w[outside])
+        if w is None:
+            scores.append(score(name, y[inside], p[inside], decision))
+        else:
+            scores.append(weighted(y[inside], to_labels(p[inside], decision), w[inside]))
+    return scores, fit_decision(name, y, p, time_limit=per_fold_limit, sample_weight=w)
+
+
+# ---------------------------------------------------------------- сдвиг пропорций классов
+
+def estimate_priors(proba: Any, train_priors: Any, *, max_iter: int = 200, tol: float = 1e-7) -> np.ndarray:
+    """Пропорции классов в выборке по вероятностям модели, обученной при train_priors (EM, Saerens et al., 2002).
+
+    Работает, если вероятности откалиброваны и меняются только пропорции классов, а не p(x | класс).
+    """
+    p = np.clip(_proba_matrix(np.asarray(proba, dtype=float)), 1e-12, 1.0)
+    base = np.clip(np.asarray(train_priors, dtype=float), 1e-12, None)
+    base = base / base.sum()
+    priors = base.copy()
+    for _ in range(max_iter):
+        adjusted = p * (priors / base)
+        adjusted /= adjusted.sum(axis=1, keepdims=True)
+        new = adjusted.mean(axis=0)
+        if np.max(np.abs(new - priors)) < tol:
+            priors = new
+            break
+        priors = new
+    return priors / priors.sum()

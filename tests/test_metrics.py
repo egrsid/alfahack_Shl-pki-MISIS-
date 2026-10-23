@@ -143,3 +143,33 @@ def test_binary_threshold_and_untunable_metrics():
     assert decision["kind"] == "threshold" and decision["threshold"] < 0.5
     assert M.score("f1", y, p, decision) > M.score("f1", y, p)
     assert M.fit_decision("roc_auc", y, p) is None and M.fit_decision("recall", y, p) is None
+
+
+def test_estimate_priors_recovers_label_shift():
+    rng = np.random.default_rng(3)
+    k, n = 3, 20_000
+    means = np.array([[-2.0, 0.0], [0.0, 2.0], [2.0, 0.0]])
+
+    def sample(prior):
+        y = rng.choice(k, n, p=prior)
+        x = means[y] + rng.normal(size=(n, 2))
+        logp = -0.5 * ((x[:, None, :] - means[None]) ** 2).sum(-1) + np.log(train_prior)
+        return y, np.exp(logp) / np.exp(logp).sum(1, keepdims=True)  # точные апостериорные при train_prior
+
+    train_prior = np.array([0.6, 0.3, 0.1])
+    _, p_train = sample(train_prior)
+    assert np.allclose(M.estimate_priors(p_train, train_prior), train_prior, atol=0.02)
+    shifted = np.array([0.3, 0.3, 0.4])
+    _, p_test = sample(shifted)
+    assert np.allclose(M.estimate_priors(p_test, train_prior), shifted, atol=0.03)
+
+
+def test_decision_with_sample_weight_follows_priors():
+    rng = np.random.default_rng(4)
+    y = (rng.random(5000) < 0.1).astype(int)
+    p = np.clip(0.1 + 0.4 * y + rng.normal(scale=0.15, size=5000), 0, 1)
+    plain = M.fit_decision("f1", y, p)
+    heavy = M.fit_decision("f1", y, p, sample_weight=np.where(y == 1, 5.0, 1.0))  # в test положительных в 5 раз больше
+    assert heavy["threshold"] < plain["threshold"]
+    scores, decision = M.crossfit_decision("f1", y, p, np.arange(5000) % 5, sample_weight=np.where(y == 1, 5.0, 1.0))
+    assert len(scores) == 5 and decision["kind"] == "threshold"
