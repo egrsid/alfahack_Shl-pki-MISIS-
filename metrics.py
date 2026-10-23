@@ -364,6 +364,9 @@ def score(name: str, y_true: Any, y_pred: Any, decision: dict | None = None) -> 
             raise ValueError(f"{metric.name}: regression expects 1-D predictions, got shape {pred.shape}")
         return float(metric.func(y, pred.astype(float)))
 
+    if pred.ndim == 1 and pred.dtype.kind in "OUS":  # метки в исходном виде (например, из записанного сабмита)
+        classes = classes_of(list(y_true) + list(pred))
+        y_true, pred = encode(y_true, classes), encode(pred, classes)
     y = _true_codes(y_true)
     if metric.needs_proba:
         if pred.ndim == 1 and pred.dtype.kind in "iub" and pred.max(initial=0) > 1:

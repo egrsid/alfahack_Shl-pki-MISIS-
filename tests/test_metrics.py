@@ -58,6 +58,9 @@ def test_labels_and_string_targets():
     assert M.score("macro_f1", Y_MC, P_MC.argmax(1)) == pytest.approx(M.score("macro_f1", Y_MC, P_MC))
     labels = np.array(["a", "b", "c", "d"], dtype=object)[Y_MC]
     assert M.score("accuracy", labels, P_MC) == pytest.approx(M.score("accuracy", Y_MC, P_MC))
+    predicted = np.array(["a", "b", "c", "d"], dtype=object)[P_MC.argmax(1)]  # строковые метки и в y_pred
+    assert M.score("macro_f1", labels, predicted) == pytest.approx(M.score("macro_f1", Y_MC, P_MC))
+    assert M.score("macro_f1", list(labels), list(predicted)) == pytest.approx(M.score("macro_f1", Y_MC, P_MC))
 
 
 def test_fast_metric_matches_registry():
