@@ -316,3 +316,30 @@ def test_no_entity_without_repeating_identities(tmp_path):
     assert F.load(spec, _cfg()).entity is None
     spec, _ = classification_task(tmp_path / "c", n_classes=3)  # мультикласс — не поддерживается
     assert F.load(spec, _cfg()).entity is None
+
+
+def test_contract_used_by_team_solution_and_agent_eval(tmp_path):
+    """Вызовы как в solution.py и agent_eval.LocalEvaluator (P4) из отправленного архива — контракт не ломать."""
+    import time
+    import types
+    spec, _ = classification_task(tmp_path, n_classes=3)
+    best = F.run(spec, config=_cfg())
+    assert {"folds", "train_rows", "fold_scores", "classes", "decision"} <= set(best.meta)
+    assert F.clearly_better(spec.metric, best, best) is False and np.isfinite(F.effective_cv(best))
+    # agent_eval._trainer: _params(name, SimpleNamespace(y, task, metric), FallbackConfig(seed, early_stopping), ...)
+    shape = types.SimpleNamespace(y=np.empty(900), task="classification", metric=spec.metric)
+    cfg = F.FallbackConfig(seed=42, early_stopping=100)
+    data = F.load(spec, cfg)
+    x, x_test, cats = data.frame("lightgbm")
+    for name in ("lightgbm", "xgboost", "catboost"):
+        params = F._params(name, shape, cfg, 2, {})
+        frame, frame_test, model_cats = data.frame(name)
+        tr, va = data.folds != 0, data.folds == 0
+        p_va, p_te, iters, present = F._fit_predict(name, False, params, frame[tr], data.y[tr], frame[va], data.y[va],
+                                                    frame_test, model_cats, time.monotonic() + 60, 100)
+        assert p_va.shape == (va.sum(), len(present)) and p_te.shape == (len(frame_test), len(present))
+    reg_spec, _ = regression_task(tmp_path / "r")
+    reg = F.run(reg_spec, config=_cfg())
+    shape = types.SimpleNamespace(y=np.empty(600), task="regression", metric="rmse")
+    assert F._params("lightgbm", shape, cfg, 2, {})["objective"] == "regression"
+    assert F.clearly_better("rmse", reg, reg) is False
