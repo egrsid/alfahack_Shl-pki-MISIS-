@@ -1,5 +1,5 @@
-"""Ручной smoke-тест: один короткий запрос к LLM.
-Тратит бюджет, поэтому в автотесты не входит."""
+"""Ручной smoke-тест: короткий запрос к LLM и проверка кэша.
+Тратит немного бюджета, поэтому в автотесты не входит."""
 import sys
 from pathlib import Path
 
@@ -11,16 +11,17 @@ from llm_client import LLMClient, LLMUnavailable
 
 def main() -> int:
     client = LLMClient()
+    question = [{"role": "user", "content": "Ответь одним словом: привет"}]
     try:
-        answer = client.chat(
-            [{"role": "user", "content": "Ответь одним словом: привет"}],
-            # токенов берём с запасом: если модель сначала "думает", ответ может обрезаться
-            max_tokens=500,
-        )
+        # первый запрос идёт в API, второй такой же должен прийти из кэша
+        first = client.chat(question, max_tokens=500)
+        second = client.chat(question, max_tokens=500)
     except LLMUnavailable as e:
         print("LLM недоступна:", e)
         return 1
-    print("Ответ LLM:", repr(answer))
+    print("Ответ LLM:", repr(first))
+    print("Второй ответ такой же:", first == second)
+    print("Расход:", client.usage_summary())
     return 0
 
 
