@@ -5,9 +5,11 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 
+import jsonschema
 import openai
 from openai import OpenAI
 
@@ -56,6 +58,32 @@ def _is_retryable(e: Exception) -> bool:
     if isinstance(e, openai.APIStatusError):
         return e.status_code == 429 or e.status_code >= 500
     return False
+
+
+def _extract_json(text: str) -> dict:
+    # модель может вывести блок рассуждений <think>...</think>, его выкидываем
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+    # собираем варианты, где может лежать JSON, и пробуем по очереди
+    candidates = [text]
+    # вариант 1: JSON обёрнут в ```json ... ```
+    fence = re.search(r"```(?:json)?\s*(.*?)```", text, flags=re.DOTALL)
+    if fence:
+        candidates.append(fence.group(1).strip())
+    # вариант 2: JSON окружён обычным текстом, берём от первой { до последней }
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        candidates.append(text[start:end + 1])
+
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        # нам нужен именно объект, а не список или число
+        if isinstance(data, dict):
+            return data
+    raise ValueError("в ответе нет корректного JSON-объекта")
 
 
 class LLMClient:
@@ -130,6 +158,14 @@ class LLMClient:
         except Exception:
             pass  # кэш нужен для экономии, из-за него падать нельзя
 
+    def _cache_delete(self, path: Path | None) -> None:
+        if path is None:
+            return
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
     # ---------- учёт токенов ----------
 
     def _register_usage(self, resp) -> None:
@@ -200,3 +236,54 @@ class LLMClient:
         raise LLMUnavailable(
             f"LLM не ответила после {MAX_RETRIES} попыток: {last_error}"
         ) from last_error
+
+    def chat_json(
+        self,
+        messages: list[dict],
+        schema: dict | None = None,
+        fix_attempts: int = 2,
+        **kwargs,
+    ) -> dict:
+        """Запрос, в котором ждём от модели JSON-объект.
+
+        Если JSON не нашёлся или не подошёл под schema, просим модель
+        исправиться, до fix_attempts раз. В самом промпте нужно просить JSON.
+        """
+        # путь кэша для исходного запроса: туда в конце положим проверенный ответ
+        orig_path = self._cache_path(messages, kwargs)
+        current = list(messages)
+
+        for attempt in range(fix_attempts + 1):
+            # на первой попытке можно взять кэш, на повторных нужен свежий ответ
+            text = self.chat(current, use_cache=(attempt == 0), **kwargs)
+            try:
+                data = _extract_json(text)
+                if schema is not None:
+                    jsonschema.validate(data, schema)
+            except (ValueError, jsonschema.ValidationError) as e:
+                # у ValidationError есть .message, у ValueError только str(e)
+                problem = getattr(e, "message", str(e))
+                log.info("LLM: плохой JSON (попытка %d): %s", attempt + 1, problem)
+                # показываем модели её ответ и говорим, что не так
+                if text:
+                    current = current + [{"role": "assistant", "content": text}]
+                current = current + [{
+                    "role": "user",
+                    "content": (
+                        f"Ответ не подходит: {problem}. "
+                        "Верни только исправленный JSON-объект, без пояснений и без markdown."
+                    ),
+                }]
+                continue
+
+            # если пришлось исправлять, кладём хороший ответ в кэш под исходный запрос,
+            # чтобы в следующий раз не мучиться заново
+            if attempt > 0:
+                self._cache_write(orig_path, json.dumps(data, ensure_ascii=False))
+            return data
+
+        # так и не получилось: плохой ответ из кэша убираем, чтобы он не мешал потом
+        self._cache_delete(orig_path)
+        raise LLMUnavailable(
+            f"Модель не вернула корректный JSON за {fix_attempts + 1} попытки"
+        )
