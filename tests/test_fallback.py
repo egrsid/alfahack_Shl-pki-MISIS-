@@ -262,3 +262,57 @@ def test_cv_folds_match_run_and_skip_rows_without_target(tmp_path):
     assert np.array_equal(folds, cand.meta["folds"]) and scheme["kind"] == cand.meta["cv_scheme"]["kind"]
     assert len(rows) == len(folds) == 598 and 3 not in rows and 7 not in rows
     assert np.array_equal(cand.meta["train_rows"], rows) and scheme["n_splits"] == 5
+
+
+def _panel_task(tmp_path, n_entities=600, periods=5, seed=0):
+    """Сущности с уникальным атрибутом наблюдаются по периодам; таргет = свой уровень сущности + шум. test — новый период."""
+    rng = np.random.default_rng(seed)
+    area = rng.uniform(1000, 90000, n_entities).round(1)
+    kind = rng.choice(["office", "school", "home"], n_entities)
+    level = rng.normal(80, 25, n_entities)
+    rows = []
+    for p in range(1, periods + 2):
+        seen = rng.random(n_entities) < 0.8
+        for e in np.flatnonzero(seen):
+            rows.append({"year": p, "area": area[e], "kind": kind[e], "temp": rng.normal(10 + p, 1),
+                         "y": level[e] + 2 * p + rng.normal(scale=3)})
+    df = pd.DataFrame(rows)
+    df.insert(0, "id", range(len(df)))
+    train, test = df[df.year <= periods], df[df.year == periods + 1].drop(columns="y")
+    write_task(tmp_path, train, test, pd.DataFrame({"id": test.id, "y": 0.0}))
+    return Spec(tmp_path, "id", "y", "regression", "rmse")
+
+
+def test_entity_detected_and_improves_cv(tmp_path):
+    spec = _panel_task(tmp_path)
+    data = F.load(spec, _cfg())
+    assert data.cv_scheme["kind"] == "period" and data.entity is not None
+    assert data.entity["identity"] == ["area"] and set(data.entity["columns"]) == {"area", "kind"}
+    cand = F.run(spec, config=_cfg())
+    runs = {r["name"]: r["cv"] for r in cand.meta["runs"]}
+    assert runs["lightgbm_entity"] < 0.7 * min(runs["lightgbm"], runs.get("lightgbm_noperiod", np.inf))
+    assert cand.meta["entity_key"]["identity"] == ["area"] and submission.check_file(spec) == []
+
+
+def test_entity_features_use_only_past_and_never_own_row(tmp_path):
+    spec = _panel_task(tmp_path, n_entities=200)
+    data = F.load(spec, _cfg())
+    f = 0
+    train_idx, valid_idx = np.flatnonzero(data.folds != f), np.flatnonzero(data.folds == f)
+    e_tr, e_va, e_te = F.entity_features(data, train_idx, valid_idx)
+    key, order, y = data.entity["key_train"], data.period_order, data.y
+    for pos in range(0, len(train_idx), 7):  # каждая проверяемая строка: статистика только по более ранним периодам
+        r = train_idx[pos]
+        src = train_idx[(order[train_idx] < order[r]) & (key[train_idx] == key[r])]
+        assert e_tr[pos, 1] == len(src) and r not in src
+        if len(src):
+            assert np.isclose(e_tr[pos, 0], y[src].mean())
+    assert np.all(e_va[:, 1] <= (order[train_idx] < order[valid_idx][0]).sum())
+    assert e_te.shape == (len(data.entity["key_test"]), 3)
+
+
+def test_no_entity_without_repeating_identities(tmp_path):
+    spec, _ = regression_task(tmp_path)  # непрерывные признаки без повторов — сущностей нет
+    assert F.load(spec, _cfg()).entity is None
+    spec, _ = classification_task(tmp_path / "c", n_classes=3)  # мультикласс — не поддерживается
+    assert F.load(spec, _cfg()).entity is None
